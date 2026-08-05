@@ -1,0 +1,4 @@
+out/
+*.apk
+!release/*.apk
+.DS_Store
