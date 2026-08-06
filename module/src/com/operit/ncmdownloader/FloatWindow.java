@@ -344,12 +344,13 @@ public class FloatWindow {
             @Override
             public void run() {
                 try {
-                    String id = NcmApi.resolveId(input);
+                    String[] r = NcmApi.resolveLink(input);
+                    String id = (r != null) ? r[1] : null;
                     if (id == null) {
                         postStatus("无法解析歌单ID");
                         return;
                     }
-                    final List<NcmApi.Song> list = NcmApi.fetchPlaylist(id);
+                    final List<NcmApi.Song> list = NcmApi.fetchPlaylist(id, null);
                     songs.clear();
                     songs.addAll(list);
                     root.post(new Runnable() {

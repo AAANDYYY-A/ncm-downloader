@@ -1,13 +1,11 @@
 package com.operit.ncmdownloader;
 
-import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.Context;
-import android.content.pm.PackageManager;
-import android.media.MediaMetadata;
-import android.media.session.MediaController;
-import android.media.session.MediaSessionManager;
-import android.os.Build;
+import android.content.SharedPreferences;
+import android.media.MediaPlayer;
+import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.View;
@@ -23,36 +21,35 @@ import android.widget.Toast;
 import java.util.ArrayList;
 import java.util.List;
 
-/** 模块 UI：查看当前播放歌曲ID、选音质下载、歌单一键下载 */
+/**
+ * 网易云下载器（无需 root / Xposed）
+ * 输入网易云分享链接（单曲/歌单/163cn短链）→ 解析 → 下载 → 本地播放。
+ */
 public class MainActivity extends Activity {
 
-    private static final String TARGET = "com.netease.cloudmusic";
+    private static final String PREF = "ncm_pref";
+    private static final String KEY_MUSICU = "music_u";
 
-    private TextView tvTitle, tvId, tvStatus;
-    private EditText etPlaylist;
-    private LinearLayout songList;
-    private RadioGroup qualityGroup;
+    private EditText etInput;
+    private RadioGroup rgType;
+    private LinearLayout resultArea;
+    private LinearLayout downloadedArea;
+    private TextView tvStatus;
 
-    private String currentId = "";
-    private String currentTitle = "";
-    private String currentArtist = "";
-    private String currentMusicU = "";
+    // 播放器
+    private MediaPlayer mp;
+    private String nowPlaying = "";
+    private Button btnPlay, btnStop;
+    private TextView tvNow;
+
     private List<NcmApi.Song> currentSongs = new ArrayList<NcmApi.Song>();
+    private int currentBr = NcmApi.BR_HIGH;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        requestStoragePermission();
         buildUi();
-        startMediaSessionListener();
-    }
-
-    private void requestStoragePermission() {
-        if (Build.VERSION.SDK_INT >= 23 && Build.VERSION.SDK_INT < 29) {
-            if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, 1);
-            }
-        }
+        refreshDownloaded();
     }
 
     private void buildUi() {
@@ -64,81 +61,123 @@ public class MainActivity extends Activity {
         scroll.addView(root, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
 
-        // 标题
-        root.addView(title("🎵 网易云自动下载", 20, true));
+        root.addView(title("🎵 网易云下载器", 20, true));
+        root.addView(title("无需root，粘贴网易云分享链接即可下载并播放", 12, false));
 
-        // 当前播放区块
-        root.addView(title("▶ 当前播放", 16, true));
-        tvTitle = new TextView(this);
-        tvTitle.setText("未检测到播放");
-        tvTitle.setTextSize(15);
-        root.addView(tvTitle);
-        tvId = new TextView(this);
-        tvId.setText("ID: -");
-        tvId.setTextSize(14);
-        root.addView(tvId);
+        // 输入区
+        etInput = new EditText(this);
+        etInput.setHint("粘贴分享链接，如 https://music.163.com/song?id=xxx\n或歌单 https://music.163.com/playlist?id=xxx / 163cn.tv/xxx / 纯ID");
+        etInput.setTextSize(13);
+        etInput.setMinLines(2);
+        root.addView(etInput);
 
-        // 音质选择
-        root.addView(title("音质", 16, true));
-        qualityGroup = new RadioGroup(this);
-        qualityGroup.setOrientation(RadioGroup.HORIZONTAL);
-        RadioButton rbStd = new RadioButton(this);
-        rbStd.setText("标准 128k");
-        rbStd.setId(1001);
-        RadioButton rbHigh = new RadioButton(this);
-        rbHigh.setText("高 320k");
-        rbHigh.setId(1002);
-        RadioButton rbLoss = new RadioButton(this);
-        rbLoss.setText("无损(需VIP)");
-        rbLoss.setId(1003);
-        qualityGroup.addView(rbStd);
-        qualityGroup.addView(rbHigh);
-        qualityGroup.addView(rbLoss);
-        qualityGroup.check(1002);
-        root.addView(qualityGroup);
-
-        Button btnDownload = new Button(this);
-        btnDownload.setText("下载当前歌曲");
-        btnDownload.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                downloadCurrent();
-            }
-        });
-        root.addView(btnDownload);
-
-        // 分割
-        root.addView(title("📋 歌单下载", 16, true));
-        etPlaylist = new EditText(this);
-        etPlaylist.setHint("输入歌单ID或分享链接，如 383599882 或 163cn.tv/xxxx");
-        etPlaylist.setTextSize(14);
-        root.addView(etPlaylist);
+        // 类型选择（纯数字输入时生效）
+        rgType = new RadioGroup(this);
+        rgType.setOrientation(RadioGroup.HORIZONTAL);
+        RadioButton rbSong = new RadioButton(this);
+        rbSong.setText("单曲");
+        rbSong.setId(2001);
+        RadioButton rbList = new RadioButton(this);
+        rbList.setText("歌单");
+        rbList.setId(2002);
+        rgType.addView(rbSong);
+        rgType.addView(rbList);
+        rgType.check(2002);
+        root.addView(rgType);
 
         LinearLayout row1 = new LinearLayout(this);
         row1.setOrientation(LinearLayout.HORIZONTAL);
-        Button btnFetch = new Button(this);
-        btnFetch.setText("获取歌单");
-        btnFetch.setOnClickListener(new View.OnClickListener() {
+        Button btnParse = new Button(this);
+        btnParse.setText("解析");
+        btnParse.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                fetchAndShowPlaylist();
+                parseInput();
             }
         });
-        Button btnAll = new Button(this);
-        btnAll.setText("一键下载全部");
-        btnAll.setOnClickListener(new View.OnClickListener() {
+        Button btnLogin = new Button(this);
+        btnLogin.setText("登录设置");
+        btnLogin.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                downloadAll();
+                showLoginDialog();
             }
         });
-        row1.addView(btnFetch, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        row1.addView(btnAll, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row1.addView(btnParse, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row1.addView(btnLogin, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         root.addView(row1);
 
-        songList = new LinearLayout(this);
-        songList.setOrientation(LinearLayout.VERTICAL);
-        root.addView(songList);
+        // 音质
+        LinearLayout brRow = new LinearLayout(this);
+        brRow.setOrientation(LinearLayout.HORIZONTAL);
+        brRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView brLabel = new TextView(this);
+        brLabel.setText("音质:");
+        brLabel.setTextSize(13);
+        brRow.addView(brLabel);
+        final RadioGroup brGroup = new RadioGroup(this);
+        brGroup.setOrientation(RadioGroup.HORIZONTAL);
+        addBr(brGroup, "128k", NcmApi.BR_STANDARD, false);
+        addBr(brGroup, "320k", NcmApi.BR_HIGH, true);
+        addBr(brGroup, "无损", NcmApi.BR_LOSSLESS, false);
+        brGroup.setOnCheckedChangeListener(new RadioGroup.OnCheckedChangeListener() {
+            @Override
+            public void onCheckedChanged(RadioGroup group, int checkedId) {
+                currentBr = checkedId;
+            }
+        });
+        brRow.addView(brGroup);
+        root.addView(brRow);
+
+        // 解析结果区
+        root.addView(title("📄 解析结果", 15, true));
+        resultArea = new LinearLayout(this);
+        resultArea.setOrientation(LinearLayout.VERTICAL);
+        root.addView(resultArea);
+
+        // 我的下载
+        root.addView(title("💾 我的下载 (Music/NCM自动下载)", 15, true));
+        downloadedArea = new LinearLayout(this);
+        downloadedArea.setOrientation(LinearLayout.VERTICAL);
+        root.addView(downloadedArea);
+        Button btnRefresh = new Button(this);
+        btnRefresh.setText("刷新下载列表");
+        btnRefresh.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                refreshDownloaded();
+            }
+        });
+        root.addView(btnRefresh);
+
+        // 播放器栏
+        root.addView(title("▶ 播放器", 15, true));
+        LinearLayout playerRow = new LinearLayout(this);
+        playerRow.setOrientation(LinearLayout.HORIZONTAL);
+        playerRow.setGravity(Gravity.CENTER_VERTICAL);
+        btnPlay = new Button(this);
+        btnPlay.setText("▶");
+        btnPlay.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                togglePlay();
+            }
+        });
+        btnStop = new Button(this);
+        btnStop.setText("■");
+        btnStop.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                stopPlay();
+            }
+        });
+        tvNow = new TextView(this);
+        tvNow.setText("未播放");
+        tvNow.setTextSize(13);
+        playerRow.addView(btnPlay);
+        playerRow.addView(btnStop);
+        playerRow.addView(tvNow, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        root.addView(playerRow);
 
         // 状态
         tvStatus = new TextView(this);
@@ -150,145 +189,175 @@ public class MainActivity extends Activity {
         setContentView(scroll);
     }
 
-    private TextView title(String text, float sp, boolean bold) {
-        TextView tv = new TextView(this);
-        tv.setText(text);
-        tv.setTextSize(sp);
-        tv.setPadding(0, dp(6), 0, dp(2));
-        if (bold) tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
-        return tv;
+    private void addBr(RadioGroup g, String label, final int br, boolean checked) {
+        RadioButton rb = new RadioButton(this);
+        rb.setText(label);
+        rb.setTextSize(12);
+        rb.setId(br);
+        rb.setChecked(checked);
+        g.addView(rb);
     }
 
-    private int dp(int v) {
-        return Math.round(getResources().getDisplayMetrics().density * v);
-    }
-
-    // ===== 当前歌曲数据通道 =====
-    private void startMediaSessionListener() {
-        // 通道1：模块Hook写入的ContentProvider（跨进程，Android13+也可靠）
-        registerProviderObserver();
-        queryProvider();
-        // 通道2：直接MediaSessionManager（Android12-可用；13+无权限会回退）
-        try {
-            final MediaSessionManager msm = (MediaSessionManager) getSystemService(Context.MEDIA_SESSION_SERVICE);
-            if (msm == null) return;
-            MediaSessionManager.OnActiveSessionsChangedListener listener = new MediaSessionManager.OnActiveSessionsChangedListener() {
-                @Override
-                public void onActiveSessionsChanged(List<MediaController> controllers) {
-                    handleControllers(controllers);
-                }
-            };
-            msm.addOnActiveSessionsChangedListener(listener, null);
-            handleControllers(msm.getActiveSessions(null));
-        } catch (Throwable t) {
-            // Android13+ 无 MEDIA_CONTENT_CONTROL 权限，使用模块 Provider 数据
-            setStatus("已切换到模块数据通道");
-        }
-    }
-
-    private void registerProviderObserver() {
-        try {
-            getContentResolver().registerContentObserver(CurrentProvider.URI, true,
-                    new android.database.ContentObserver(new android.os.Handler(android.os.Looper.getMainLooper())) {
-                        @Override
-                        public void onChange(boolean selfChange) {
-                            queryProvider();
-                        }
-                    });
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void queryProvider() {
-        try {
-            android.database.Cursor c = getContentResolver().query(CurrentProvider.URI, null, null, null, null);
-            if (c != null) {
-                if (c.moveToFirst()) {
-                    final String id = c.getString(0);
-                    final String title = c.getString(1);
-                    final String artist = c.getString(2);
-                    final String mu = c.getString(3);
-                    if (mu != null) currentMusicU = mu;
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            if (id != null && id.length() > 0) {
-                                currentId = id;
-                                currentTitle = title;
-                                currentArtist = artist;
-                                tvTitle.setText((artist == null ? "" : artist) + " - " + (title == null ? "" : title));
-                                tvId.setText("ID: " + id);
-                            }
-                        }
-                    });
-                }
-                c.close();
-            }
-        } catch (Throwable t) {
-            setStatus("查询播放状态失败: " + t.getMessage());
-        }
-    }
-
-    private void handleControllers(List<MediaController> controllers) {
-        if (controllers == null) return;
-        for (MediaController c : controllers) {
-            try {
-                if (c == null || c.getPackageName() == null) continue;
-                if (!TARGET.equals(c.getPackageName())) continue;
-                MediaMetadata md = c.getMetadata();
-                if (md == null) continue;
-                String id = md.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
-                if (id == null) continue;
-                currentId = extractId(id);
-                currentTitle = md.getString(MediaMetadata.METADATA_KEY_TITLE);
-                currentArtist = md.getString(MediaMetadata.METADATA_KEY_ARTIST);
-                final String t = currentTitle, a = currentArtist, i = currentId;
-                runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        tvTitle.setText((a == null ? "" : a) + " - " + (t == null ? "" : t));
-                        tvId.setText("ID: " + i);
-                    }
-                });
-            } catch (Throwable ignored) {
-            }
-        }
-    }
-
-    private String extractId(String mediaId) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < mediaId.length(); i++) {
-            char ch = mediaId.charAt(i);
-            if (Character.isDigit(ch)) sb.append(ch);
-            else if (sb.length() > 0) break;
-        }
-        return sb.toString();
-    }
-
-    // ===== 下载当前 =====
-    private void downloadCurrent() {
-        final String id = currentId;
-        if (id == null || id.length() == 0) {
-            toast("未检测到当前播放的网易云歌曲");
+    // ===== 解析输入 =====
+    private void parseInput() {
+        final String raw = etInput.getText().toString().trim();
+        if (raw.length() == 0) {
+            toast("请先粘贴网易云分享链接");
             return;
         }
-        final int br = getSelectedBr();
-        final String t = currentTitle == null ? id : currentTitle;
-        final String a = currentArtist == null ? "未知歌手" : currentArtist;
-        setStatus("下载中: " + a + " - " + t);
+        setStatus("解析中...");
         new Thread(new Runnable() {
             @Override
             public void run() {
                 try {
-                    String url = NcmApi.fetchPlayUrl(id, br, currentMusicU);
-                    if (url == null) throw new Exception("未获取到播放链接(该歌曲需VIP/付费，当前账号非VIP或未登录)");
-                    final String fname = NcmApi.sanitize(a) + " - " + NcmApi.sanitize(t) + ".mp3";
+                    String[] r = NcmApi.resolveLink(raw);
+                    if (r == null || r[1] == null) {
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                setStatus("❌ 无法识别链接，请检查是否为网易云分享链接");
+                            }
+                        });
+                        return;
+                    }
+                    String type = r[0];
+                    final String id = r[1];
+                    if ("raw".equals(type)) {
+                        type = rgType.getCheckedRadioButtonId() == 2001 ? "song" : "playlist";
+                    }
+                    final String ftype = type;
+                    final String cookie = getCookie();
+                    if ("song".equals(ftype)) {
+                        final NcmApi.Song s = NcmApi.fetchSongInfo(id, cookie);
+                        if (s == null) throw new Exception("歌曲不存在或已下架");
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                showSong(s);
+                                setStatus("单曲解析成功 ID=" + id);
+                            }
+                        });
+                    } else {
+                        final List<NcmApi.Song> songs = NcmApi.fetchPlaylist(id, cookie);
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                showPlaylist(songs);
+                                setStatus("歌单解析成功，共 " + songs.size() + " 首");
+                            }
+                        });
+                    }
+                } catch (final Exception e) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            setStatus("❌ 解析失败: " + e.getMessage());
+                        }
+                    });
+                }
+            }
+        }).start();
+    }
+
+    private void showSong(final NcmApi.Song s) {
+        resultArea.removeAllViews();
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        TextView name = new TextView(this);
+        name.setText(s.displayName() + (s.isFree() ? "  [免费]" : "  [VIP/付费]"));
+        name.setTextSize(14);
+        Button btnDown = new Button(this);
+        btnDown.setText("⬇下载");
+        btnDown.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                downloadSong(s);
+            }
+        });
+        Button btnPlay = new Button(this);
+        btnPlay.setText("▶播放");
+        btnPlay.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                playOnline(s);
+            }
+        });
+        row.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(btnDown, new LinearLayout.LayoutParams(dp(90), LinearLayout.LayoutParams.WRAP_CONTENT));
+        row.addView(btnPlay, new LinearLayout.LayoutParams(dp(90), LinearLayout.LayoutParams.WRAP_CONTENT));
+        resultArea.addView(row);
+    }
+
+    private void showPlaylist(final List<NcmApi.Song> songs) {
+        resultArea.removeAllViews();
+        currentSongs = songs;
+        // 全部下载按钮
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        TextView cnt = new TextView(this);
+        cnt.setText("共 " + songs.size() + " 首");
+        cnt.setTextSize(13);
+        Button btnAll = new Button(this);
+        btnAll.setText("一键下载全部");
+        btnAll.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                downloadAll();
+            }
+        });
+        top.addView(cnt, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        top.addView(btnAll);
+        resultArea.addView(top);
+
+        for (final NcmApi.Song s : songs) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(0, dp(3), 0, dp(3));
+            TextView name = new TextView(this);
+            name.setText(s.displayName() + (s.isFree() ? "" : " [VIP]"));
+            name.setTextSize(12);
+            Button btnD = new Button(this);
+            btnD.setText("下");
+            btnD.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    downloadSong(s);
+                }
+            });
+            Button btnP = new Button(this);
+            btnP.setText("播");
+            btnP.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    playOnline(s);
+                }
+            });
+            row.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            row.addView(btnD, new LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.WRAP_CONTENT));
+            row.addView(btnP, new LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.WRAP_CONTENT));
+            resultArea.addView(row);
+        }
+    }
+
+    // ===== 下载 =====
+    private void downloadSong(final NcmApi.Song s) {
+        setStatus("下载中: " + s.name);
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), currentBr, getCookie());
+                    if (url == null) throw new Exception("无播放链接(需VIP/付费，请先登录)");
+                    final String fname = NcmApi.sanitize(s.artist) + " - " + NcmApi.sanitize(s.name) + ".mp3";
                     NcmApi.downloadToStorage(MainActivity.this, url, fname);
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
-                            setStatus("✅ 下载完成: " + fname);
+                            setStatus("✅ 已保存: " + fname);
                             toast("已保存到 Music/NCM自动下载/");
+                            refreshDownloaded();
                         }
                     });
                 } catch (final Exception e) {
@@ -303,143 +372,28 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private int getSelectedBr() {
-        int id = qualityGroup.getCheckedRadioButtonId();
-        if (id == 1001) return NcmApi.BR_STANDARD;
-        if (id == 1003) return NcmApi.BR_LOSSLESS;
-        return NcmApi.BR_HIGH;
-    }
-
-    // ===== 歌单 =====
-    private void fetchAndShowPlaylist() {
-        final String raw = etPlaylist.getText().toString().trim();
-        if (raw.length() == 0) {
-            toast("请输入歌单ID或链接");
-            return;
-        }
-        setStatus("解析歌单...");
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    final String pid = NcmApi.resolveId(raw);
-                    if (pid == null) {
-                        runOnUiThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                setStatus("❌ 无法解析歌单ID");
-                            }
-                        });
-                        return;
-                    }
-                    final List<NcmApi.Song> songs = NcmApi.fetchPlaylist(pid);
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            showPlaylist(songs);
-                        }
-                    });
-                } catch (final Exception e) {
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            setStatus("❌ 获取歌单失败: " + e.getMessage());
-                        }
-                    });
-                }
-            }
-        }).start();
-    }
-
-    private void showPlaylist(List<NcmApi.Song> songs) {
-        currentSongs = songs;
-        songList.removeAllViews();
-        setStatus("歌单共 " + songs.size() + " 首");
-        for (final NcmApi.Song s : songs) {
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setPadding(0, dp(3), 0, dp(3));
-            TextView name = new TextView(this);
-            name.setText(s.name + "\n" + (s.artist == null ? "" : s.artist)
-                    + (s.isFree() ? "  [免费]" : "  [VIP/付费]"));
-            name.setTextSize(13);
-            Button btn = new Button(this);
-            btn.setText("下载");
-            btn.setOnClickListener(new View.OnClickListener() {
-                @Override
-                public void onClick(View v) {
-                    downloadOne(s);
-                }
-            });
-            row.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-            row.addView(btn, new LinearLayout.LayoutParams(dp(80), LinearLayout.LayoutParams.WRAP_CONTENT));
-            songList.addView(row);
-        }
-    }
-
-    private void downloadOne(final NcmApi.Song s) {
-        if (!s.isFree()) {
-            setStatus("⏭ 跳过VIP/付费: " + s.name);
-            toast("跳过VIP/付费歌曲: " + s.name);
-            return;
-        }
-        final int br = getSelectedBr();
-        setStatus("下载中: " + s.name);
-        new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), br, currentMusicU);
-                    if (url == null) throw new Exception("无播放链接(需VIP/付费)");
-                    final String fname = NcmApi.sanitize(s.artist) + " - " + NcmApi.sanitize(s.name) + ".mp3";
-                    NcmApi.downloadToStorage(MainActivity.this, url, fname);
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            setStatus("✅ 下载完成: " + s.name);
-                        }
-                    });
-                } catch (final Exception e) {
-                    runOnUiThread(new Runnable() {
-                        @Override
-                        public void run() {
-                            setStatus("❌ " + s.name + ": " + e.getMessage());
-                        }
-                    });
-                }
-            }
-        }).start();
-    }
-
     private void downloadAll() {
         if (currentSongs.size() == 0) {
-            toast("请先获取歌单");
+            toast("请先解析歌单");
             return;
         }
-        final int br = getSelectedBr();
-        setStatus("开始批量下载 " + currentSongs.size() + " 首...");
+        setStatus("批量下载 " + currentSongs.size() + " 首...");
         new Thread(new Runnable() {
             @Override
             public void run() {
                 int ok = 0, fail = 0, skip = 0;
+                final String cookie = getCookie();
                 for (final NcmApi.Song s : currentSongs) {
                     if (!s.isFree()) {
                         skip++;
                         continue;
                     }
                     try {
-                        String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), br, currentMusicU);
-                        if (url == null) throw new Exception("无链接(需VIP)");
+                        String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), currentBr, cookie);
+                        if (url == null) throw new Exception("no url");
                         final String fname = NcmApi.sanitize(s.artist) + " - " + NcmApi.sanitize(s.name) + ".mp3";
                         NcmApi.downloadToStorage(MainActivity.this, url, fname);
                         ok++;
-                        final int curOk = ok;
-                        runOnUiThread(new Runnable() {
-                            @Override
-                            public void run() {
-                                setStatus("批量下载 " + curOk + "/" + currentSongs.size() + ": " + s.name);
-                            }
-                        });
                     } catch (Throwable e) {
                         fail++;
                     }
@@ -448,12 +402,175 @@ public class MainActivity extends Activity {
                 runOnUiThread(new Runnable() {
                     @Override
                     public void run() {
-                        setStatus("批量下载完成: 成功 " + fok + "，跳过VIP " + fskip + "，失败 " + ffail);
-                        toast("批量下载完成: 成功 " + fok + "，跳过VIP " + fskip + "，失败 " + ffail);
+                        setStatus("批量完成: 成功 " + fok + "，跳过VIP " + fskip + "，失败 " + ffail);
+                        toast("批量完成: 成功 " + fok + "，跳过VIP " + fskip + "，失败 " + ffail);
+                        refreshDownloaded();
                     }
                 });
             }
         }).start();
+    }
+
+    // ===== 播放 =====
+    private void playOnline(final NcmApi.Song s) {
+        setStatus("获取播放链接...");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), currentBr, getCookie());
+                    if (url == null) throw new Exception("无播放链接(需VIP/付费，请先登录)");
+                    final String u = url;
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            playUri(Uri.parse(u), s.displayName());
+                        }
+                    });
+                } catch (final Exception e) {
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            setStatus("❌ 播放失败: " + e.getMessage());
+                        }
+                    });
+                }
+            }
+        }).start();
+    }
+
+    private void playUri(Uri uri, String displayName) {
+        try {
+            stopPlay();
+            mp = new MediaPlayer();
+            mp.setDataSource(this, uri);
+            mp.setOnPreparedListener(new MediaPlayer.OnPreparedListener() {
+                @Override
+                public void onPrepared(MediaPlayer mp) {
+                    mp.start();
+                }
+            });
+            mp.setOnCompletionListener(new MediaPlayer.OnCompletionListener() {
+                @Override
+                public void onCompletion(MediaPlayer mp) {
+                    setStatus("播放完成");
+                }
+            });
+            mp.prepareAsync();
+            nowPlaying = displayName;
+            tvNow.setText(displayName);
+            btnPlay.setText("⏸");
+            setStatus("▶ 播放中: " + displayName);
+        } catch (Throwable t) {
+            setStatus("❌ 播放失败: " + t.getMessage());
+        }
+    }
+
+    private void togglePlay() {
+        if (mp == null) {
+            toast("请先选择要播放的歌曲");
+            return;
+        }
+        try {
+            if (mp.isPlaying()) {
+                mp.pause();
+                btnPlay.setText("▶");
+                setStatus("⏸ 已暂停: " + nowPlaying);
+            } else {
+                mp.start();
+                btnPlay.setText("⏸");
+                setStatus("▶ 播放中: " + nowPlaying);
+            }
+        } catch (Throwable t) {
+            toast("播放器错误: " + t.getMessage());
+        }
+    }
+
+    private void stopPlay() {
+        try {
+            if (mp != null) {
+                mp.stop();
+                mp.release();
+            }
+        } catch (Throwable ignored) {
+        }
+        mp = null;
+        nowPlaying = "";
+        btnPlay.setText("▶");
+        tvNow.setText("未播放");
+    }
+
+    // ===== 我的下载 =====
+    private void refreshDownloaded() {
+        downloadedArea.removeAllViews();
+        final List<String[]> list = NcmApi.queryDownloaded(this);
+        if (list.size() == 0) {
+            TextView empty = new TextView(this);
+            empty.setText("（暂无下载，解析链接后点击下载）");
+            empty.setTextSize(12);
+            downloadedArea.addView(empty);
+            return;
+        }
+        for (final String[] item : list) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            TextView name = new TextView(this);
+            name.setText(item[1]);
+            name.setTextSize(12);
+            Button btnP = new Button(this);
+            btnP.setText("▶");
+            btnP.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    playUri(Uri.parse(item[0]), item[1]);
+                }
+            });
+            row.addView(name, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            row.addView(btnP, new LinearLayout.LayoutParams(dp(56), LinearLayout.LayoutParams.WRAP_CONTENT));
+            downloadedArea.addView(row);
+        }
+    }
+
+    // ===== 登录设置（可选，VIP下载）=====
+    private void showLoginDialog() {
+        final EditText et = new EditText(this);
+        et.setHint("粘贴 MUSIC_U（网易云网页版登录后从Cookie获取）");
+        et.setText(getCookie());
+        et.setTextSize(13);
+        new AlertDialog.Builder(this)
+                .setTitle("登录设置")
+                .setMessage("填写 MUSIC_U 可下载VIP歌曲（留空=匿名仅免费歌曲）")
+                .setView(et)
+                .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int w) {
+                        String mu = et.getText().toString().trim();
+                        getSharedPreferences(PREF, MODE_PRIVATE).edit().putString(KEY_MUSICU, mu).apply();
+                        toast(mu.length() > 0 ? "已保存登录Cookie" : "已清除Cookie");
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private String getCookie() {
+        String mu = getSharedPreferences(PREF, MODE_PRIVATE).getString(KEY_MUSICU, "");
+        return mu.length() > 0 ? "MUSIC_U=" + mu : "";
+    }
+
+    // ===== 工具 =====
+    private TextView title(String text, float sp, boolean bold) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextSize(sp);
+        tv.setPadding(0, dp(6), 0, dp(2));
+        if (bold) tv.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        return tv;
+    }
+
+    private int dp(int v) {
+        return Math.round(getResources().getDisplayMetrics().density * v);
     }
 
     private void setStatus(final String msg) {
@@ -467,5 +584,11 @@ public class MainActivity extends Activity {
 
     private void toast(String msg) {
         Toast.makeText(this, msg, Toast.LENGTH_LONG).show();
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopPlay();
+        super.onDestroy();
     }
 }

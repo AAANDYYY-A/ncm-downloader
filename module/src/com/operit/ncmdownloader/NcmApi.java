@@ -7,6 +7,9 @@ import android.os.Build;
 import android.os.Environment;
 import android.provider.MediaStore;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
@@ -18,7 +21,10 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** 网易云 API 封装：播放链接、歌单、下载、链接解析 */
+/**
+ * 网易云 API 封装：单曲/歌单信息、播放链接、下载、分享链接解析。
+ * 全部走 HTTPS 公开接口，无需 root / Xposed。
+ */
 public class NcmApi {
 
     public static final int BR_STANDARD = 128000;
@@ -43,42 +49,87 @@ public class NcmApi {
         public boolean isFree() {
             return fee == 0 || fee == 8;
         }
+
+        public String displayName() {
+            return (artist == null || artist.length() == 0 ? "未知歌手" : artist)
+                    + " - " + (name == null || name.length() == 0 ? String.valueOf(id) : name);
+        }
     }
 
-    /** 解析用户输入：纯数字ID 或 分享链接，返回数字ID */
-    public static String resolveId(String input) {
+    /**
+     * 解析用户输入（分享链接/纯数字/短链），返回 {type, id}
+     * type: "song" / "playlist" / "raw"(纯数字无法判断类型)
+     */
+    public static String[] resolveLink(String input) {
         if (input == null) return null;
         input = input.trim();
         if (input.length() == 0) return null;
-        if (input.matches("\\d+")) return input;
-
-        Matcher m = Pattern.compile("https?://163cn\\.tv/[A-Za-z0-9]+").matcher(input);
-        if (m.find()) {
-            String loc = followRedirect(m.group());
-            if (loc != null) {
-                Matcher idm = Pattern.compile("id=(\\d+)").matcher(loc);
-                if (idm.find()) return idm.group(1);
-            }
+        if (input.matches("\\d+")) {
+            return new String[]{"raw", input};
         }
-        Matcher idm = Pattern.compile("id=(\\d+)").matcher(input);
-        if (idm.find()) return idm.group(1);
-        return null;
+        String url = input;
+        // 网易云短链 163cn.tv（兼容误写 63cn.tv）
+        Matcher sm = Pattern.compile("https?://(?:163|63)cn\\.tv/[A-Za-z0-9]+").matcher(input);
+        if (sm.find()) {
+            String loc = followRedirect(sm.group());
+            if (loc != null) url = loc;
+        }
+        String type;
+        if (url.contains("/playlist") || url.contains("playlist?")) {
+            type = "playlist";
+        } else if (url.contains("/song") || url.contains("song?id")) {
+            type = "song";
+        } else {
+            type = "raw";
+        }
+        String id = null;
+        Matcher idm = Pattern.compile("(?:song|playlist)[^\\d]*id=(\\d+)").matcher(url);
+        if (idm.find()) {
+            id = idm.group(1);
+        } else {
+            idm = Pattern.compile("id=(\\d+)").matcher(url);
+            if (idm.find()) id = idm.group(1);
+        }
+        return new String[]{type, id};
     }
 
+    /** 短链跳转解析（302/301/303/307 + HTML回退） */
     private static String followRedirect(String url) {
         HttpURLConnection conn = null;
         try {
             conn = (HttpURLConnection) new URL(url).openConnection();
             conn.setInstanceFollowRedirects(false);
-            conn.setConnectTimeout(15000);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0");
-            int code = conn.getResponseCode();
-            if (code >= 300 && code < 400) {
-                String loc = conn.getHeaderField("Location");
-                if (loc != null) {
-                    // 可能多次跳转
-                    if (loc.contains("163cn.tv")) return followRedirect(loc);
-                    return loc;
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(20000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+            int code;
+            try {
+                code = conn.getResponseCode();
+            } catch (Throwable t) {
+                return null;
+            }
+            String loc = conn.getHeaderField("Location");
+            if (loc != null && loc.length() > 0) {
+                if (!loc.startsWith("http")) {
+                    int slash = url.indexOf('/', 8);
+                    String base = slash > 0 ? url.substring(0, slash) : url;
+                    loc = base + (loc.startsWith("/") ? "" : "/") + loc;
+                }
+                if (loc.contains("163cn.tv") || loc.contains("63cn.tv")) {
+                    return followRedirect(loc);
+                }
+                return loc;
+            }
+            if (code == 200) {
+                // 部分短链返回HTML，尝试从 body 提取跳转目标
+                InputStream in = conn.getInputStream();
+                byte[] buf = new byte[8192];
+                int n = in.read(buf);
+                in.close();
+                if (n > 0) {
+                    String body = new String(buf, 0, n, "UTF-8");
+                    String target = extractFromBody(body);
+                    if (target != null) return target;
                 }
             }
         } catch (Throwable ignored) {
@@ -86,6 +137,73 @@ public class NcmApi {
             if (conn != null) conn.disconnect();
         }
         return null;
+    }
+
+    /** 从短链HTML body中提取跳转目标 */
+    private static String extractFromBody(String body) {
+        if (body == null) return null;
+        String[][] pats = {
+                {"song", "song\\?id=(\\d+)"},
+                {"playlist", "playlist\\?id=(\\d+)"},
+                {"song", "\\\"id\\\":(\\d+)"},
+                {"raw", "id=(\\d+)"}
+        };
+        for (String[] p : pats) {
+            Matcher m = Pattern.compile(p[1]).matcher(body);
+            if (m.find()) {
+                return "https://music.163.com/" + p[0] + "?id=" + m.group(1);
+            }
+        }
+        return null;
+    }
+
+    /** 单曲详情 */
+    public static Song fetchSongInfo(String id, String cookie) throws Exception {
+        String api = "https://music.163.com/api/song/detail?ids=[" + id + "]";
+        String json = httpGet(api, cookie);
+        JSONObject o = new JSONObject(json);
+        JSONArray arr = o.optJSONArray("songs");
+        if (arr == null || arr.length() == 0) return null;
+        return parseSongJson(arr.getJSONObject(0));
+    }
+
+    /** 歌单全部歌曲 */
+    public static List<Song> fetchPlaylist(String id, String cookie) throws Exception {
+        String api = "https://music.163.com/api/playlist/detail?id=" + id;
+        String json = httpGet(api, cookie);
+        JSONObject o = new JSONObject(json);
+        JSONObject result = o.optJSONObject("result");
+        List<Song> list = new ArrayList<Song>();
+        if (result == null) return list;
+        JSONArray tr = result.optJSONArray("tracks");
+        if (tr != null) {
+            for (int i = 0; i < tr.length(); i++) {
+                Song s = parseSongJson(tr.optJSONObject(i));
+                if (s != null) list.add(s);
+            }
+        }
+        return list;
+    }
+
+    private static Song parseSongJson(JSONObject o) {
+        if (o == null) return null;
+        try {
+            long id = o.optLong("id");
+            String name = o.optString("name");
+            JSONArray artists = o.optJSONArray("artists");
+            String artist = "";
+            if (artists != null && artists.length() > 0) {
+                JSONObject a0 = artists.optJSONObject(0);
+                if (a0 != null) artist = a0.optString("name");
+            }
+            String album = "";
+            JSONObject alb = o.optJSONObject("album");
+            if (alb != null) album = alb.optString("name");
+            int fee = o.optInt("fee");
+            return new Song(id, name, artist, album, fee);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /** 获取歌曲播放链接（不同br），带登录Cookie可下VIP歌曲 */
@@ -133,54 +251,85 @@ public class NcmApi {
         }
     }
 
-    /** 获取歌单全部歌曲 */
-    public static List<Song> fetchPlaylist(String id) throws Exception {
-        String api = "https://music.163.com/api/playlist/detail?id=" + id;
-        String json = httpGet(api);
-        List<Song> list = new ArrayList<Song>();
-        int ti = json.indexOf("\"tracks\":");
-        if (ti < 0) return list;
-        String tracks = json.substring(ti + 9);
-        parseTracks(tracks, list);
+    /** 查询已下载到 Music/NCM自动下载/ 的歌曲，返回 List<String[]>{uri, displayName} */
+    public static List<String[]> queryDownloaded(Context context) {
+        List<String[]> list = new ArrayList<String[]>();
+        try {
+            android.database.Cursor c = context.getContentResolver().query(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+                    new String[]{MediaStore.MediaColumns._ID,
+                            MediaStore.MediaColumns.DISPLAY_NAME,
+                            MediaStore.MediaColumns.RELATIVE_PATH,
+                            MediaStore.MediaColumns.DURATION},
+                    MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?",
+                    new String[]{"%NCM自动下载%"},
+                    MediaStore.MediaColumns.DATE_ADDED + " DESC");
+            if (c != null) {
+                while (c.moveToNext()) {
+                    long id = c.getLong(0);
+                    String name = c.getString(1);
+                    Uri uri = android.content.ContentUris.withAppendedId(
+                            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id);
+                    list.add(new String[]{uri.toString(), name});
+                }
+                c.close();
+            }
+        } catch (Throwable ignored) {
+        }
         return list;
     }
 
-    private static void parseTracks(String tracks, List<Song> out) {
-        // 匹配每首歌的起始 {id:xxx,"name":"yyy"
-        Pattern songHead = Pattern.compile("\\{\"id\":(\\d+),\"name\":\"((?:[^\"\\\\]|\\\\.)*)\"");
-        Pattern artistP = Pattern.compile("\"artists\":\\[\\{\"name\":\"((?:[^\"\\\\]|\\\\.)*)\"");
-        Pattern albumP = Pattern.compile("\"album\":\\{\"name\":\"((?:[^\"\\\\]|\\\\.)*)\"");
-        Pattern feeP = Pattern.compile("\"fee\":(\\d+)");
-        Matcher m = songHead.matcher(tracks);
-        int lastEnd = 0;
-        while (m.find()) {
-            long id = Long.parseLong(m.group(1));
-            String name = unescape(m.group(2));
-            String artist = "";
-            String album = "";
-            // 在该歌曲对象范围内提取artist/album（下一个songHead之前）
-            int segStart = m.start();
-            int segEnd = tracks.length();
-            Matcher nm = songHead.matcher(tracks);
-            if (nm.find(segStart + 1)) {
-                segEnd = nm.start();
+    /** 下载音频流到 Music/NCM自动下载/，返回 MediaStore Uri（可播放） */
+    public static Uri downloadToStorage(Context context, String url, String fname) throws Exception {
+        if (url != null && url.startsWith("http://")) {
+            url = "https://" + url.substring(7);
+        }
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setConnectTimeout(20000);
+        conn.setReadTimeout(120000);
+        conn.setInstanceFollowRedirects(true);
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        conn.setRequestProperty("Referer", "https://music.163.com/");
+        InputStream in = conn.getInputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        if (Build.VERSION.SDK_INT >= 29) {
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.MediaColumns.DISPLAY_NAME, fname);
+            cv.put(MediaStore.MediaColumns.MIME_TYPE, "audio/mpeg");
+            cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/NCM自动下载");
+            Uri uri = context.getContentResolver().insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cv);
+            if (uri == null) {
+                in.close();
+                conn.disconnect();
+                throw new Exception("MediaStore 插入失败");
             }
-            String seg = tracks.substring(segStart, segEnd);
-            Matcher am = artistP.matcher(seg);
-            if (am.find()) artist = unescape(am.group(1));
-            Matcher alm = albumP.matcher(seg);
-            if (alm.find()) album = unescape(alm.group(1));
-            int fee = 0;
-            Matcher fm = feeP.matcher(seg);
-            if (fm.find()) fee = Integer.parseInt(fm.group(1));
-            out.add(new Song(id, name, artist, album, fee));
-            lastEnd = m.end();
+            OutputStream os = context.getContentResolver().openOutputStream(uri);
+            while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+            os.close();
+            in.close();
+            conn.disconnect();
+            return uri;
+        } else {
+            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "NCM自动下载");
+            if (!dir.exists() && !dir.mkdirs()) {
+                in.close();
+                conn.disconnect();
+                throw new Exception("目录创建失败");
+            }
+            File f = new File(dir, fname);
+            FileOutputStream fos = new FileOutputStream(f);
+            while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+            fos.close();
+            in.close();
+            conn.disconnect();
+            return Uri.fromFile(f);
         }
     }
 
-    private static String unescape(String s) {
+    public static String sanitize(String s) {
         if (s == null) return "";
-        return s.replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\");
+        return s.replaceAll("[\\\\/:*?\"<>|\\n\\r]", "_").trim();
     }
 
     private static String httpGet(String url) throws Exception {
@@ -206,56 +355,5 @@ public class NcmApi {
         in.close();
         conn.disconnect();
         return sb.toString();
-    }
-
-    /** 下载音频流到 Music/NCM自动下载/ */
-    public static void downloadToStorage(Context context, String url, String fname) throws Exception {
-        // 网易云播放链接为http明文，Android9+默认禁止明文；CDN支持https，强制升级
-        if (url != null && url.startsWith("http://")) {
-            url = "https://" + url.substring(7);
-        }
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(20000);
-        conn.setReadTimeout(120000);
-        conn.setInstanceFollowRedirects(true);
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0");
-        InputStream in = conn.getInputStream();
-        byte[] buf = new byte[8192];
-        int n;
-        if (Build.VERSION.SDK_INT >= 29) {
-            ContentValues cv = new ContentValues();
-            cv.put(MediaStore.MediaColumns.DISPLAY_NAME, fname);
-            cv.put(MediaStore.MediaColumns.MIME_TYPE, "audio/mpeg");
-            cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/NCM自动下载");
-            Uri uri = context.getContentResolver().insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cv);
-            if (uri == null) {
-                in.close();
-                conn.disconnect();
-                throw new Exception("MediaStore 插入失败");
-            }
-            OutputStream os = context.getContentResolver().openOutputStream(uri);
-            while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
-            os.close();
-            in.close();
-            conn.disconnect();
-        } else {
-            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "NCM自动下载");
-            if (!dir.exists() && !dir.mkdirs()) {
-                in.close();
-                conn.disconnect();
-                throw new Exception("目录创建失败");
-            }
-            File f = new File(dir, fname);
-            FileOutputStream fos = new FileOutputStream(f);
-            while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
-            fos.close();
-            in.close();
-            conn.disconnect();
-        }
-    }
-
-    public static String sanitize(String s) {
-        if (s == null) return "";
-        return s.replaceAll("[\\\\/:*?\"<>|\\n\\r]", "_").trim();
     }
 }
