@@ -1,7 +1,9 @@
 package com.operit.ncmdownloader;
 
+import android.app.DownloadManager;
 import android.content.ContentValues;
 import android.content.Context;
+import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -206,9 +208,86 @@ public class NcmApi {
         }
     }
 
-    /** 获取歌曲播放链接（不同br），带登录Cookie可下VIP歌曲 */
+    /**
+     * 获取歌曲播放/下载链接（多API通道，总有一个能出URL）
+     * 1. /api/song/enhance/player/url —— 播放接口（带Cookie可下VIP）
+     * 2. /song/media/outer/url?id=x.mp3 —— 最老外链接口（免费歌曲兜底，无需Cookie）
+     */
     public static String fetchPlayUrl(String id, int br, String cookie) throws Exception {
-        String api = "https://music.163.com/api/song/enhance/player/url?ids=[" + id + "]&br=" + br;
+        String[] apis = {
+                "https://music.163.com/api/song/enhance/player/url?ids=[" + id + "]&br=" + br,
+                "https://music.163.com/song/media/outer/url?id=" + id + ".mp3"
+        };
+        for (String api : apis) {
+            try {
+                String u = fetchUrlFromApi(api, cookie);
+                if (u != null && u.length() > 0) {
+                    return u;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    /** 老外链接口单独取URL（免费歌曲，302->mp3） */
+    public static String fetchOuterUrl(String id) {
+        try {
+            return fetchUrlFromApi("https://music.163.com/song/media/outer/url?id=" + id + ".mp3", null);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 下载（多轮新URL重试 + http/https变体 + 老外链接口兜底） */
+    public static Uri downloadWithFallback(Context ctx, String id, int br, String cookie, String fname) throws Exception {
+        Exception last = null;
+        // 两轮：每轮用全新URL（CDN链接有时效，过期会403）
+        for (int i = 0; i < 2; i++) {
+            String url = null;
+            try {
+                url = fetchPlayUrl(id, br, cookie);
+            } catch (Throwable ignored) {
+            }
+            if (url == null) {
+                continue;
+            }
+            try {
+                return downloadToStorage(ctx, url, fname);
+            } catch (Exception e) {
+                last = e;
+            }
+        }
+        // 最老外链接口兜底（免费歌曲往往可下）
+        String outer = fetchOuterUrl(id);
+        if (outer != null) {
+            try {
+                return downloadToStorage(ctx, outer, fname);
+            } catch (Exception ignored) {
+            }
+        }
+        throw last != null ? last : new Exception("无播放链接(需VIP/付费，请先登录)");
+    }
+
+    private static String fetchUrlFromApi(String api, String cookie) throws Exception {
+        if (api.contains("outer/url")) {
+            // 老外链接口返回302 -> Location指向mp3
+            HttpURLConnection conn = (HttpURLConnection) new URL(api).openConnection();
+            conn.setInstanceFollowRedirects(false);
+            conn.setConnectTimeout(15000);
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+            conn.setRequestProperty("Referer", "https://music.163.com/");
+            int code = conn.getResponseCode();
+            String loc = conn.getHeaderField("Location");
+            conn.disconnect();
+            if (loc != null && (code == 301 || code == 302 || code == 303 || code == 307)) {
+                if (!loc.startsWith("http")) {
+                    loc = "https://music.163.com" + (loc.startsWith("/") ? "" : "/") + loc;
+                }
+                return loc;
+            }
+            return null;
+        }
         String json = httpGet(api, cookie);
         int idx = json.indexOf("\"url\":\"");
         if (idx < 0) return null;
@@ -279,17 +358,105 @@ public class NcmApi {
         return list;
     }
 
-    /** 下载音频流到 Music/NCM自动下载/，返回 MediaStore Uri（可播放） */
+    /** 下载音频流到 Music/NCM自动下载/，返回 Uri（可播放）；失败自动重试一次 + 系统DownloadManager兜底 */
     public static Uri downloadToStorage(Context context, String url, String fname) throws Exception {
-        if (url != null && url.startsWith("http://")) {
-            url = "https://" + url.substring(7);
+        Exception lastErr = null;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            try {
+                return downloadOnce(context, url, fname);
+            } catch (Exception e) {
+                lastErr = e;
+                try {
+                    Thread.sleep(800);
+                } catch (Throwable ignored) {
+                }
+            }
         }
+        // HttpURLConnection 被CDN拒绝(403)时，改用系统DownloadManager（系统网络栈）
+        try {
+            return downloadViaDownloadManager(context, url, fname);
+        } catch (Throwable t) {
+            // 忽略，抛原始错误
+        }
+        throw lastErr != null ? lastErr : new Exception("下载失败");
+    }
+
+    /** 系统DownloadManager下载（保存到 Music/NCM自动下载/，等待完成） */
+    private static Uri downloadViaDownloadManager(Context context, String url, String fname) throws Exception {
+        DownloadManager dm = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);
+        DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
+        req.setAllowedNetworkTypes(DownloadManager.Request.NETWORK_WIFI | DownloadManager.Request.NETWORK_MOBILE);
+        req.setTitle(fname);
+        req.setNotificationVisibility(DownloadManager.Request.VISIBILITY_HIDDEN);
+        req.addRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        req.addRequestHeader("Referer", "https://music.163.com/");
+        String dir = Environment.DIRECTORY_MUSIC + "/NCM自动下载";
+        req.setDestinationInExternalPublicDir(Environment.DIRECTORY_MUSIC, "NCM自动下载/" + fname);
+        long id = dm.enqueue(req);
+        // 轮询等待完成（最多5分钟）
+        long deadline = System.currentTimeMillis() + 300000;
+        DownloadManager.Query q = new DownloadManager.Query().setFilterById(id);
+        while (System.currentTimeMillis() < deadline) {
+            Cursor c = null;
+            try {
+                c = dm.query(q);
+                if (c != null && c.moveToFirst()) {
+                    int status = c.getInt(c.getColumnIndex(DownloadManager.COLUMN_STATUS));
+                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                        c.close();
+                        File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "NCM自动下载/" + fname);
+                        return Uri.fromFile(f);
+                    } else if (status == DownloadManager.STATUS_FAILED) {
+                        int reason = c.getInt(c.getColumnIndex(DownloadManager.COLUMN_REASON));
+                        c.close();
+                        throw new Exception("下载失败 reason=" + reason);
+                    }
+                }
+            } finally {
+                if (c != null) c.close();
+            }
+            Thread.sleep(1200);
+        }
+        throw new Exception("下载超时");
+    }
+
+    private static Uri downloadOnce(Context context, String url, String fname) throws Exception {
+        // 网易云CDN链接为http明文（App端即http下载）。优先原样http，失败再试https变体
+        try {
+            return downloadRaw(context, url, fname);
+        } catch (Exception e) {
+            if (url != null && url.startsWith("http://")) {
+                String httpsUrl = "https://" + url.substring(7);
+                return downloadRaw(context, httpsUrl, fname);
+            }
+            throw e;
+        }
+    }
+
+    private static Uri downloadRaw(Context context, String url, String fname) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
         conn.setConnectTimeout(20000);
         conn.setReadTimeout(120000);
         conn.setInstanceFollowRedirects(true);
         conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
         conn.setRequestProperty("Referer", "https://music.163.com/");
+        conn.setRequestProperty("Accept", "*/*");
+        int code = conn.getResponseCode();
+        if (code != 200) {
+            String errBody = "";
+            try {
+                InputStream es = conn.getErrorStream();
+                if (es != null) {
+                    byte[] b = new byte[256];
+                    int n = es.read(b);
+                    if (n > 0) errBody = new String(b, 0, n, "UTF-8");
+                    es.close();
+                }
+            } catch (Throwable ignored) {
+            }
+            conn.disconnect();
+            throw new Exception("HTTP " + code + " " + errBody.trim());
+        }
         InputStream in = conn.getInputStream();
         byte[] buf = new byte[8192];
         int n;
