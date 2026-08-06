@@ -55,7 +55,22 @@ public class FloatWindow {
             return;
         }
         try {
-            inst = new FloatWindow(act);
+            final Activity a = act;
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                inst = new FloatWindow(a);
+            } else {
+                // 非主线程调用时，切到主线程创建（WindowManager需要主线程Looper）
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            inst = new FloatWindow(a);
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + " 悬浮窗创建失败: " + t);
+                        }
+                    }
+                });
+            }
         } catch (Throwable t) {
             XposedBridge.log(TAG + " 悬浮窗创建失败: " + t);
         }

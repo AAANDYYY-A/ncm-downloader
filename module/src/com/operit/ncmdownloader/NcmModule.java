@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AppOpsManager;
 import android.content.ContentValues;
 import android.content.Context;
+import android.database.Cursor;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.os.Bundle;
@@ -17,9 +18,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * 网易云音乐自动下载模块
  * 原理：
- *  1. Hook MediaSession.setMetadata 拦截当前播放歌曲（网易云进程内，无权限问题）
+ *  1. Hook MediaSession.setMetadata / MediaMetadata.Builder.build 拦截当前播放歌曲
  *  2. 歌曲信息写入 CurrentProvider（跨进程），UI 进程实时读取显示
- *  3. 自动下载到 Music/NCM自动下载/
+ *  3. 悬浮窗启动走 Activity.onCreate（主线程直接调用，不依赖线程调度）
+ *  4. 自动下载受设置页"自动下载"开关控制；工作模式=仅手动时禁用模块自动功能
  */
 public class NcmModule implements IXposedHookLoadPackage {
 
@@ -39,85 +41,42 @@ public class NcmModule implements IXposedHookLoadPackage {
         }
         XposedBridge.log(TAG + " 模块已加载 process=" + process);
 
-        // 早期获取 Application Context
+        // 早期获取 Application Context（attach 参数可能是 ContextImpl，取其 Application）
         XposedHelpers.findAndHookMethod(android.app.Application.class, "attach", Context.class, new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                appContext = (Context) param.args[0];
-                installHooks();
-                // 注册 Activity 生命周期回调：任何 Activity 恢复时启动悬浮窗
-                // 比 Xposed hook 更可靠（不依赖 Activity.onCreate 的 hook 时机）
                 try {
-                    final Context c = appContext;
-                    ((android.app.Application) c).registerActivityLifecycleCallbacks(
-                            new android.app.Application.ActivityLifecycleCallbacks() {
-                                @Override
-                                public void onActivityResumed(Activity activity) {
-                                    try {
-                                        FloatWindow.show(activity);
-                                    } catch (Throwable t) {
-                                        XposedBridge.log(TAG + " 悬浮窗启动失败: " + t);
-                                    }
-                                }
-
-                                @Override
-                                public void onActivityCreated(Activity activity, Bundle savedInstanceState) {
-                                }
-
-                                @Override
-                                public void onActivityStarted(Activity activity) {
-                                }
-
-                                @Override
-                                public void onActivityPaused(Activity activity) {
-                                }
-
-                                @Override
-                                public void onActivityStopped(Activity activity) {
-                                }
-
-                                @Override
-                                public void onActivitySaveInstanceState(Activity activity, Bundle outState) {
-                                }
-
-                                @Override
-                                public void onActivityDestroyed(Activity activity) {
-                                }
-                            });
-                    XposedBridge.log(TAG + " Activity生命周期回调已注册");
+                    Context base = (Context) param.args[0];
+                    if (base instanceof android.app.Application) {
+                        appContext = base;
+                    } else {
+                        Context app = base.getApplicationContext();
+                        appContext = app != null ? app : base;
+                    }
                 } catch (Throwable t) {
-                    XposedBridge.log(TAG + " 注册ActivityLifecycleCallbacks失败: " + t);
+                    XposedBridge.log(TAG + " attach取Context失败: " + t);
                 }
+                installHooks();
             }
         });
 
-        // 兜底：Activity.onCreate 时初始化 + 启动悬浮窗
+        // 主路径：Activity.onCreate 时初始化并启动悬浮窗（hook回调本身在主线程）
         XposedHelpers.findAndHookMethod(Activity.class, "onCreate", Bundle.class, new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                if (appContext == null && param.thisObject instanceof Activity) {
-                    appContext = ((Activity) param.thisObject).getApplicationContext();
-                }
-                installHooks();
-                // 延迟启动悬浮窗，等界面稳定
                 try {
-                    final Activity act = (Activity) param.thisObject;
-                    new Thread(new Runnable() {
-                        @Override
-                        public void run() {
-                            try {
-                                Thread.sleep(1500);
-                            } catch (Throwable ignored) {
-                            }
-                            try {
-                                FloatWindow.show(act);
-                            } catch (Throwable t) {
-                                XposedBridge.log(TAG + " 悬浮窗启动失败: " + t);
-                            }
-                        }
-                    }).start();
+                    if (appContext == null && param.thisObject instanceof Activity) {
+                        appContext = ((Activity) param.thisObject).getApplicationContext();
+                    }
+                    installHooks();
+                    // 直接在主线程启动悬浮窗（当前就是主线程）
+                    try {
+                        FloatWindow.show((Activity) param.thisObject);
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " 悬浮窗启动失败: " + t);
+                    }
                 } catch (Throwable t) {
-                    XposedBridge.log(TAG + " 悬浮窗调度失败: " + t);
+                    XposedBridge.log(TAG + " onCreate调度失败: " + t);
                 }
             }
         });
@@ -129,52 +88,25 @@ public class NcmModule implements IXposedHookLoadPackage {
         }
         try {
             XposedBridge.log(TAG + " 安装 Hook");
-            // 绕过悬浮窗权限检查（OP_SYSTEM_ALERT_WINDOW = 24）
             hookAppOps();
-            // 拦截 MediaSession.setMetadata 获取当前歌曲
+            // 渠道1：MediaSession.setMetadata（主播放通道）
             XposedHelpers.findAndHookMethod(MediaSession.class, "setMetadata", MediaMetadata.class, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                    try {
-                        MediaMetadata md = (MediaMetadata) param.args[0];
-                        if (md == null) {
-                            return;
-                        }
-                        String id = md.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
-                        if (id == null || id.length() == 0) {
-                            return;
-                        }
-                        String pureId = extractDigits(id);
-                        if (pureId.length() == 0) {
-                            return;
-                        }
-                        String title = md.getString(MediaMetadata.METADATA_KEY_TITLE);
-                        String artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST);
-                        XposedBridge.log(TAG + " 歌曲变化 id=" + pureId + " | " + artist + " - " + title);
-
-                        // 写入跨进程 Provider 供 UI 显示
-                        try {
-                            ContentValues cv = new ContentValues();
-                            cv.put("id", pureId);
-                            if (title != null) cv.put("title", title);
-                            if (artist != null) cv.put("artist", artist);
-                            appContext.getContentResolver().update(CurrentProvider.URI, cv, null, null);
-                        } catch (Throwable t) {
-                            XposedBridge.log(TAG + " 写入Provider失败 " + t);
-                        }
-
-                        // 更新悬浮窗
-                        FloatWindow.updateSong(pureId, title, artist);
-
-                        // 自动下载
-                        if (title != null && artist != null) {
-                            Downloader.getInstance().onSongDetected(appContext, pureId, title, artist);
-                        }
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + " setMetadata hook err " + t);
-                    }
+                    handleMetadata((MediaMetadata) param.args[0]);
                 }
             });
+            // 渠道2：MediaMetadata.Builder.build()（兼容 MediaSessionCompat 等间接路径）
+            try {
+                XposedHelpers.findAndHookMethod(MediaMetadata.Builder.class, "build", new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                        handleMetadata((MediaMetadata) param.getResult());
+                    }
+                });
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + " Builder.build hook失败(可选): " + t);
+            }
             hooked = true;
             XposedBridge.log(TAG + " Hook 安装完成");
 
@@ -195,6 +127,74 @@ public class NcmModule implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + " installHooks失败 " + t);
         }
+    }
+
+    private void handleMetadata(MediaMetadata md) {
+        try {
+            if (md == null) {
+                return;
+            }
+            String id = md.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
+            if (id == null || id.length() == 0) {
+                return;
+            }
+            String pureId = extractDigits(id);
+            if (pureId.length() == 0) {
+                return;
+            }
+            String title = md.getString(MediaMetadata.METADATA_KEY_TITLE);
+            String artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST);
+            XposedBridge.log(TAG + " 歌曲变化 id=" + pureId + " | " + artist + " - " + title);
+
+            // 写入跨进程 Provider 供 UI 显示
+            try {
+                ContentValues cv = new ContentValues();
+                cv.put("id", pureId);
+                if (title != null) cv.put("title", title);
+                if (artist != null) cv.put("artist", artist);
+                appContext.getContentResolver().update(CurrentProvider.URI, cv, null, null);
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + " 写入Provider失败 " + t);
+            }
+
+            // 更新悬浮窗
+            FloatWindow.updateSong(pureId, title, artist);
+
+            // 自动下载（受设置开关控制）
+            if (title != null && artist != null && isAutoDownloadEnabled()) {
+                Downloader.getInstance().onSongDetected(appContext, pureId, title, artist);
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " handleMetadata err " + t);
+        }
+    }
+
+    /** 读取设置：工作模式 + 自动下载开关 + 默认音质 */
+    private static boolean isAutoDownloadEnabled() {
+        try {
+            if (appContext == null) {
+                return true;
+            }
+            Cursor c = appContext.getContentResolver().query(CurrentProvider.SETTINGS_URI, null, null, null, null);
+            if (c != null) {
+                try {
+                    if (c.moveToFirst()) {
+                        String mode = c.getString(0);
+                        boolean auto = c.getInt(1) == 1;
+                        // 仅手动模式：禁用模块自动功能
+                        if ("manual".equals(mode)) {
+                            return false;
+                        }
+                        return auto;
+                    }
+                } finally {
+                    c.close();
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " 读取设置失败: " + t);
+        }
+        return true;
     }
 
     /** 绕过悬浮窗权限检查：OP_SYSTEM_ALERT_WINDOW=24 一律放行 */
