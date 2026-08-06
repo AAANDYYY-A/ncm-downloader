@@ -17,14 +17,16 @@
 - 自动获取当前播放歌曲（Hook `MediaSession.setMetadata`，进程内拦截）
 - 自动同步登录 Cookie（读取 `cm_cookie_storage.xml` 的 `MUSIC_U`，VIP 可下）
 - 悬浮窗选音质、下载当前歌曲、输入歌单 ID 一键批量下载
+- **悬浮球**：点击悬浮窗 `—` 最小化为可拖动小图标（♪），点图标恢复面板
+- **设置页**：工作模式（自动/仅手动）、自动下载开关、默认音质，实时生效（无需重启）
 - 可选：切歌自动下载到 `Music/NCM自动下载/`
-
+- **下载兜底链**：老接口多通道（`player/url` + `enhance/download/url` + 外链）→ http/https 双变体 → 系统 DownloadManager，最大成功率
 ## 📦 使用
-
 1. 环境要求：Android 10+（root 模式需 [LSPosed](https://github.com/LSPosed/LSPosed)）
-2. 安装 `release/ncm-downloader-v1.7.apk`
+2. 安装 `release/ncm-downloader-v1.8.apk`
 3. 无 root：打开 App → 粘贴分享链接 → 解析 → 下载/播放
 4. root：LSPosed 启用模块，作用域勾选网易云音乐 → 重启网易云，悬浮窗自动出现
+5. ⚙ 设置：App 内「设置」→ 切换工作模式/自动下载/音质 → 保存（模块实时读取）
 
 ## 🏗️ 原理
 
