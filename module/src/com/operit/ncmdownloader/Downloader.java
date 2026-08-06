@@ -135,114 +135,21 @@ public class Downloader {
     }
 
     private void download(Context context, String id, String fname) throws Exception {
-        // 1. 获取真实播放链接
-        String url = fetchUrl(id);
-        if (url == null) {
-            throw new Exception("未获取到播放链接 id=" + id);
-        }
-        // 网易云播放链接为http明文，Android9+默认禁止明文；CDN支持https，强制升级
-        if (url.startsWith("http://")) {
-            url = "https://" + url.substring(7);
-        }
-        XposedBridge.log(TAG + " 获取到播放链接: " + url);
-
-        // 2. 下载音频流
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(20000);
-        conn.setReadTimeout(120000);
-        conn.setInstanceFollowRedirects(true);
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-        conn.setRequestProperty("Referer", "https://music.163.com/");
-        InputStream in = conn.getInputStream();
-
-        byte[] buf = new byte[8192];
-        int n;
-
-        if (Build.VERSION.SDK_INT >= 29) {
-            // Android 10+ 用 MediaStore 写入公共目录（无需存储权限）
-            ContentValues cv = new ContentValues();
-            cv.put(MediaStore.MediaColumns.DISPLAY_NAME, fname);
-            cv.put(MediaStore.MediaColumns.MIME_TYPE, "audio/mpeg");
-            cv.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/NCM自动下载");
-            Uri uri = context.getContentResolver().insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, cv);
-            if (uri == null) {
-                in.close();
-                conn.disconnect();
-                throw new Exception("MediaStore 插入失败");
-            }
-            OutputStream os = context.getContentResolver().openOutputStream(uri);
-            while ((n = in.read(buf)) > 0) {
-                os.write(buf, 0, n);
-            }
-            os.close();
-            in.close();
-            conn.disconnect();
-        } else {
-            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "NCM自动下载");
-            if (!dir.exists() && !dir.mkdirs()) {
-                in.close();
-                conn.disconnect();
-                throw new Exception("创建目录失败");
-            }
-            File f = new File(dir, fname);
-            FileOutputStream fos = new FileOutputStream(f);
-            while ((n = in.read(buf)) > 0) {
-                fos.write(buf, 0, n);
-            }
-            fos.close();
-            in.close();
-            conn.disconnect();
-        }
+        // 多通道获取链接并下载（含老外链兜底+重试）
+        String mu = NcmApi.readMusicUFromFile("/data/data/com.netease.cloudmusic/shared_prefs/cm_cookie_storage.xml");
+        String cookie = (mu != null && mu.length() > 0) ? "MUSIC_U=" + mu : "";
+        NcmApi.downloadWithFallback(context, id, 320000, cookie, fname);
         XposedBridge.log(TAG + " 下载完成: " + fname);
     }
 
     private String fetchUrl(String id) {
-        HttpURLConnection conn = null;
         try {
-            String api = String.format(API_URL, id);
-            conn = (HttpURLConnection) new URL(api).openConnection();
-            conn.setConnectTimeout(20000);
-            conn.setReadTimeout(30000);
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-            conn.setRequestProperty("Referer", "https://music.163.com/");
-            // 携带网易云登录Cookie（VIP歌曲需要）
-            try {
-                String mu = NcmApi.readMusicUFromFile("/data/data/com.netease.cloudmusic/shared_prefs/cm_cookie_storage.xml");
-                if (mu != null && mu.length() > 0) {
-                    conn.setRequestProperty("Cookie", "MUSIC_U=" + mu);
-                }
-            } catch (Throwable ignored) {
-            }
-            InputStream in = conn.getInputStream();
-            StringBuilder sb = new StringBuilder();
-            byte[] buf = new byte[4096];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                sb.append(new String(buf, 0, n, "UTF-8"));
-            }
-            in.close();
-            String json = sb.toString();
-            // 解析 {"data":[{"url":"..."}]}
-            int idx = json.indexOf("\"url\":\"");
-            if (idx < 0) {
-                return null;
-            }
-            int start = idx + 7;
-            int end = json.indexOf('"', start);
-            if (end < 0) {
-                return null;
-            }
-            String url = json.substring(start, end);
-            // JSON 转义还原
-            url = url.replace("\\/", "/").replace("\\u0026", "&");
-            return url.length() > 0 ? url : null;
+            String mu = NcmApi.readMusicUFromFile("/data/data/com.netease.cloudmusic/shared_prefs/cm_cookie_storage.xml");
+            String cookie = (mu != null && mu.length() > 0) ? "MUSIC_U=" + mu : "";
+            return NcmApi.fetchPlayUrl(id, 320000, cookie);
         } catch (Throwable t) {
             XposedBridge.log(TAG + " 获取播放链接失败: " + t);
             return null;
-        } finally {
-            if (conn != null) {
-                conn.disconnect();
-            }
         }
     }
 
