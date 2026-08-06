@@ -2,6 +2,7 @@ package com.operit.ncmdownloader;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.DownloadManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
@@ -277,10 +278,8 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 try {
-                    String url = NcmApi.fetchPlayUrl(id, currentBr, getCookie());
-                    if (url == null) throw new Exception("无播放链接(需VIP/付费，请先登录)");
                     final String fname = NcmApi.sanitize(a) + " - " + NcmApi.sanitize(t) + ".mp3";
-                    NcmApi.downloadToStorage(MainActivity.this, url, fname);
+                    NcmApi.downloadWithFallback(MainActivity.this, id, currentBr, getCookie(), fname);
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
@@ -561,10 +560,8 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 try {
-                    String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), currentBr, getCookie());
-                    if (url == null) throw new Exception("无播放链接(需VIP/付费，请先登录)");
                     final String fname = NcmApi.sanitize(s.artist) + " - " + NcmApi.sanitize(s.name) + ".mp3";
-                    NcmApi.downloadToStorage(MainActivity.this, url, fname);
+                    NcmApi.downloadWithFallback(MainActivity.this, String.valueOf(s.id), currentBr, getCookie(), fname);
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
@@ -602,10 +599,8 @@ public class MainActivity extends Activity {
                         continue;
                     }
                     try {
-                        String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), currentBr, cookie);
-                        if (url == null) throw new Exception("no url");
                         final String fname = NcmApi.sanitize(s.artist) + " - " + NcmApi.sanitize(s.name) + ".mp3";
-                        NcmApi.downloadToStorage(MainActivity.this, url, fname);
+                        NcmApi.downloadWithFallback(MainActivity.this, String.valueOf(s.id), currentBr, cookie, fname);
                         ok++;
                     } catch (Throwable e) {
                         fail++;
