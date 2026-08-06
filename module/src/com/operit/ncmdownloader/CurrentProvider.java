@@ -2,6 +2,7 @@ package com.operit.ncmdownloader;
 
 import android.content.ContentProvider;
 import android.content.ContentValues;
+import android.content.Context;
 import android.database.Cursor;
 import android.database.MatrixCursor;
 import android.net.Uri;
@@ -30,17 +31,31 @@ public class CurrentProvider extends ContentProvider {
         return true;
     }
 
-    @Override
+    private static final String PREF = "ncm_pref";
+    private static final String KEY_MODE = "mode";
+    private static final String KEY_AUTODL = "auto_download";
+    private static final String KEY_BR = "br";
+
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
         return query(uri, projection, selection, selectionArgs, sortOrder, null);
     }
 
-    @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder, CancellationSignal cancellationSignal) {
         String p = uri.getPath();
         if (p != null && p.startsWith("/settings")) {
+            // 实时从磁盘读取（跨进程安全：Provider 运行在 App 进程，模块跨进程 query 走 Binder）
+            String m = mode;
+            boolean ad = autoDownload;
+            int b = br;
+            try {
+                android.content.SharedPreferences sp = getContext().getSharedPreferences(PREF, Context.MODE_PRIVATE);
+                m = sp.getString(KEY_MODE, mode);
+                ad = sp.getBoolean(KEY_AUTODL, autoDownload);
+                b = sp.getInt(KEY_BR, br);
+            } catch (Throwable ignored) {
+            }
             MatrixCursor c = new MatrixCursor(new String[]{"mode", "autoDownload", "br"});
-            c.addRow(new Object[]{mode, autoDownload ? 1 : 0, br});
+            c.addRow(new Object[]{m, ad ? 1 : 0, b});
             return c;
         }
         MatrixCursor c = new MatrixCursor(new String[]{"id", "title", "artist", "musicU"});
@@ -57,9 +72,29 @@ public class CurrentProvider extends ContentProvider {
     public Uri insert(Uri uri, ContentValues values) {
         if (values != null) {
             if (uri.getPath() != null && uri.getPath().startsWith("/settings")) {
-                if (values.containsKey("mode")) mode = values.getAsString("mode");
-                if (values.containsKey("autoDownload")) autoDownload = values.getAsInteger("autoDownload") == 1;
-                if (values.containsKey("br")) br = values.getAsInteger("br");
+                android.content.SharedPreferences.Editor ed = null;
+                try {
+                    ed = getContext().getSharedPreferences(PREF, Context.MODE_PRIVATE).edit();
+                } catch (Throwable ignored) {
+                }
+                if (values.containsKey("mode")) {
+                    mode = values.getAsString("mode");
+                    if (ed != null) ed.putString(KEY_MODE, mode);
+                }
+                if (values.containsKey("autoDownload")) {
+                    autoDownload = values.getAsInteger("autoDownload") == 1;
+                    if (ed != null) ed.putBoolean(KEY_AUTODL, autoDownload);
+                }
+                if (values.containsKey("br")) {
+                    br = values.getAsInteger("br");
+                    if (ed != null) ed.putInt(KEY_BR, br);
+                }
+                if (ed != null) {
+                    try {
+                        ed.apply();
+                    } catch (Throwable ignored) {
+                    }
+                }
             } else {
                 if (values.containsKey("id")) songId = values.getAsString("id");
                 if (values.containsKey("title")) songTitle = values.getAsString("title");
