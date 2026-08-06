@@ -44,6 +44,8 @@ public class FloatWindow {
     private LinearLayout listWrap;
     private LinearLayout listContainer;
     private Activity activity;
+    private View iconView;
+    private WindowManager.LayoutParams iconLp;
     private boolean minimized = false;
     private int br = NcmApi.BR_HIGH;
     private String currentId = "", currentTitle = "", currentArtist = "";
@@ -287,7 +289,97 @@ public class FloatWindow {
 
     private void toggleMinimize() {
         minimized = !minimized;
-        body.setVisibility(minimized ? View.GONE : View.VISIBLE);
+        if (minimized) {
+            try {
+                wm.removeView(root);
+            } catch (Throwable ignored) {
+            }
+            showIcon();
+        } else {
+            hideIcon();
+            try {
+                wm.addView(root, (WindowManager.LayoutParams) root.getLayoutParams());
+            } catch (Throwable t) {
+                XposedBridge.log(TAG + " 恢复悬浮窗失败: " + t);
+            }
+        }
+    }
+
+    private int getType() {
+        if (Build.VERSION.SDK_INT >= 26) {
+            return WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+        }
+        return WindowManager.LayoutParams.TYPE_PHONE;
+    }
+
+    /** 显示可拖动小图标（悬浮球），点击恢复面板 */
+    private void showIcon() {
+        if (iconView != null) return;
+        TextView iv = new TextView(ctx);
+        iv.setText("♪");
+        iv.setTextColor(Color.WHITE);
+        iv.setTextSize(22);
+        iv.setGravity(Gravity.CENTER);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(Color.parseColor("#E61DB954"));
+        iv.setBackgroundDrawable(bg);
+        final int size = dp(48);
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
+                size, size, getType(),
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                android.graphics.PixelFormat.TRANSLUCENT);
+        lp.gravity = Gravity.TOP | Gravity.END;
+        lp.x = dp(12);
+        lp.y = dp(200);
+        final float[] down = new float[4]; // rawX rawY lpX lpY
+        iv.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                WindowManager.LayoutParams p = (WindowManager.LayoutParams) v.getLayoutParams();
+                switch (e.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        down[0] = e.getRawX();
+                        down[1] = e.getRawY();
+                        down[2] = p.x;
+                        down[3] = p.y;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        p.x = (int) (down[2] + (e.getRawX() - down[0]));
+                        p.y = (int) (down[3] + (e.getRawY() - down[1]));
+                        try {
+                            wm.updateViewLayout(v, p);
+                        } catch (Throwable ignored) {
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        float dx = e.getRawX() - down[0];
+                        float dy = e.getRawY() - down[1];
+                        if (dx * dx + dy * dy < 400) { // 位移<20px视为点击
+                            toggleMinimize();
+                        }
+                        return true;
+                }
+                return false;
+            }
+        });
+        try {
+            wm.addView(iv, lp);
+            iconView = iv;
+            iconLp = lp;
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " 图标添加失败: " + t);
+        }
+    }
+
+    private void hideIcon() {
+        if (iconView != null) {
+            try {
+                wm.removeView(iconView);
+            } catch (Throwable ignored) {
+            }
+            iconView = null;
+        }
     }
 
     private void close() {
@@ -295,6 +387,7 @@ public class FloatWindow {
             wm.removeView(root);
         } catch (Throwable ignored) {
         }
+        hideIcon();
         inst = null;
     }
 
@@ -432,13 +525,8 @@ public class FloatWindow {
             @Override
             public void run() {
                 try {
-                    String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), br, readCookie());
-                    if (url == null) {
-                        postStatus("⏭ 需VIP/无链接: " + s.name);
-                        return;
-                    }
                     String fname = sanitize(s.artist) + " - " + sanitize(s.name) + ".mp3";
-                    NcmApi.downloadToStorage(ctx, url, fname);
+                    NcmApi.downloadWithFallback(ctx, String.valueOf(s.id), br, readCookie(), fname);
                     postStatus("✅ 已下载: " + s.name);
                 } catch (Throwable t) {
                     postStatus("下载失败: " + t.getMessage());
@@ -465,10 +553,8 @@ public class FloatWindow {
                         continue;
                     }
                     try {
-                        String url = NcmApi.fetchPlayUrl(String.valueOf(s.id), brF, cookie);
-                        if (url == null) throw new Exception("需VIP");
                         String fname = sanitize(s.artist) + " - " + sanitize(s.name) + ".mp3";
-                        NcmApi.downloadToStorage(ctx, url, fname);
+                        NcmApi.downloadWithFallback(ctx, String.valueOf(s.id), brF, cookie, fname);
                         ok++;
                     } catch (Throwable t) {
                         fail++;
