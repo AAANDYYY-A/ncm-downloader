@@ -1,24 +1,30 @@
 # NcmDownloader 🎵
 
-网易云音乐自动下载 **Xposed 模块**（LSPosed）。
+网易云音乐下载器（**双模式**：无 root 独立 App + Xposed 自动下载模块）。
 
-在网易云音乐 App 内显示悬浮窗：实时显示当前播放歌曲，支持自动下载（默认 320k 高音质）、单曲下载、歌单批量下载，VIP 歌曲可跟随登录态下载。
+## ✨ 双模式
 
-## ✨ 功能
+### ① 无 root 模式（所有人可用）
+直接安装 App，**粘贴网易云分享链接**即可下载并播放：
+- 单曲链接 `https://music.163.com/song?id=xxx` / `163cn.tv` 短链 / 纯 ID
+- 歌单链接 `https://music.163.com/playlist?id=xxx` → 一键批量下载全部
+- 内置本地播放器：解析结果可直接在线播放，已下载列表一键播放
+- 音质可选：128k / 320k / 无损
+- 登录设置：粘贴 `MUSIC_U` 后可下载 VIP 歌曲（网易云网页版登录后从 Cookie 获取）
 
-- 🪟 **悬浮窗**：显示当前歌曲 / 音质切换 / 下载按钮 / 歌单批量下载（可拖动、最小化）
-- 🔍 **歌曲检测**：Hook `MediaSession.setMetadata`，进程内拦截当前播放歌曲，无需无障碍权限
-- ⬇️ **自动下载**：检测到新歌曲自动保存到 `Music/NCM自动下载/`（Android 10+ 走 MediaStore，无需存储权限）
-- 🔑 **VIP 支持**：自动读取网易云登录 Cookie（`MUSIC_U`），VIP 歌曲可下载
-- 🧩 **跨进程 UI**：歌曲信息通过 ContentProvider 同步给 UI App（`CurrentProvider`）
+### ② root / Xposed 模式（LSPosed）
+在网易云音乐 App 内显示**悬浮窗**，全自动：
+- 自动获取当前播放歌曲（Hook `MediaSession.setMetadata`，进程内拦截）
+- 自动同步登录 Cookie（读取 `cm_cookie_storage.xml` 的 `MUSIC_U`，VIP 可下）
+- 悬浮窗选音质、下载当前歌曲、输入歌单 ID 一键批量下载
+- 可选：切歌自动下载到 `Music/NCM自动下载/`
 
 ## 📦 使用
 
-1. 环境要求：Android 10+、[LSPosed](https://github.com/LSPosed/LSPosed)（Zygisk 或 Riru 均可）
-2. 安装 `release/ncm-downloader-v1.6.apk`
-3. LSPosed 中启用模块，作用域勾选 **网易云音乐**（`com.netease.cloudmusic`）
-4. 重启网易云音乐 App，悬浮窗自动出现
-5. 网易云内**登录**（用于下载 VIP 歌曲），播放任意歌曲即可自动下载
+1. 环境要求：Android 10+（root 模式需 [LSPosed](https://github.com/LSPosed/LSPosed)）
+2. 安装 `release/ncm-downloader-v1.7.apk`
+3. 无 root：打开 App → 粘贴分享链接 → 解析 → 下载/播放
+4. root：LSPosed 启用模块，作用域勾选网易云音乐 → 重启网易云，悬浮窗自动出现
 
 ## 🏗️ 原理
 
