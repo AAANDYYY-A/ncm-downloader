@@ -33,6 +33,8 @@ public class FloatWindow {
 
     private static final String TAG = "NcmDownloader";
     private static FloatWindow inst;
+    /** 网易云前台 Activity 计数（0=不在前台，悬浮窗应隐藏） */
+    private static volatile int resumeCount = 0;
 
     private final Context ctx;
     private final WindowManager wm;
@@ -48,6 +50,8 @@ public class FloatWindow {
     private Activity activity;
     private View iconView;
     private WindowManager.LayoutParams iconLp;
+    private WindowManager.LayoutParams rootLp;
+    private boolean rootAttached = false;
     private boolean minimized = false;
     private int br = NcmApi.BR_HIGH;
     private String currentId = "", currentTitle = "", currentArtist = "";
@@ -101,6 +105,74 @@ public class FloatWindow {
     public static void updateProgress(int percent, String text) {
         if (inst != null) {
             inst.postProgress(percent, text);
+        }
+    }
+
+    /** 网易云任一 Activity 进入前台 → 悬浮窗可见 */
+    public static void onActivityResume() {
+        resumeCount++;
+        if (inst != null) {
+            inst.setForeground(true);
+        }
+    }
+
+    /** 网易云 Activity 进入后台 → 延迟检查，全部暂停则隐藏悬浮窗 */
+    public static void onActivityPause() {
+        resumeCount--;
+        if (inst != null) {
+            inst.scheduleForegroundCheck();
+        }
+    }
+
+    /** 延迟检查：400ms 后仍无前台 Activity 才隐藏（避免内部切换页面时闪烁） */
+    private void scheduleForegroundCheck() {
+        try {
+            root.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (resumeCount <= 0) {
+                        resumeCount = 0;
+                        setForeground(false);
+                    }
+                }
+            }, 400);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 前台可见性切换：离开网易云 removeView，回来重新 addView（不会挡在其他应用上方） */
+    private void setForeground(final boolean visible) {
+        try {
+            root.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (visible) {
+                            if (minimized) {
+                                if (iconView == null) showIcon();
+                            } else {
+                                if (!rootAttached) {
+                                    wm.addView(root, rootLp != null ? rootLp
+                                            : (WindowManager.LayoutParams) root.getLayoutParams());
+                                    rootAttached = true;
+                                }
+                            }
+                        } else {
+                            if (minimized) {
+                                hideIcon();
+                            } else {
+                                if (rootAttached) {
+                                    wm.removeView(root);
+                                    rootAttached = false;
+                                }
+                            }
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " 悬浮窗可见性切换失败: " + t);
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
         }
     }
 
@@ -324,8 +396,10 @@ public class FloatWindow {
         lp.gravity = Gravity.TOP | Gravity.END;
         lp.x = dp(8);
         lp.y = dp(160);
+        rootLp = lp;
         try {
             wm.addView(root, lp);
+            rootAttached = true;
             XposedBridge.log(TAG + " 悬浮窗已添加");
         } catch (Throwable t) {
             XposedBridge.log(TAG + " 悬浮窗添加失败(需悬浮窗权限): " + t);
@@ -337,13 +411,15 @@ public class FloatWindow {
         if (minimized) {
             try {
                 wm.removeView(root);
+                rootAttached = false;
             } catch (Throwable ignored) {
             }
             showIcon();
         } else {
             hideIcon();
             try {
-                wm.addView(root, (WindowManager.LayoutParams) root.getLayoutParams());
+                wm.addView(root, rootLp != null ? rootLp : (WindowManager.LayoutParams) root.getLayoutParams());
+                rootAttached = true;
             } catch (Throwable t) {
                 XposedBridge.log(TAG + " 恢复悬浮窗失败: " + t);
             }
@@ -375,8 +451,13 @@ public class FloatWindow {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 android.graphics.PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.END;
-        lp.x = dp(12);
-        lp.y = dp(200);
+        if (iconLp != null) { // 恢复上次位置
+            lp.x = iconLp.x;
+            lp.y = iconLp.y;
+        } else {
+            lp.x = dp(12);
+            lp.y = dp(200);
+        }
         final float[] down = new float[4]; // rawX rawY lpX lpY
         iv.setOnTouchListener(new View.OnTouchListener() {
             @Override
