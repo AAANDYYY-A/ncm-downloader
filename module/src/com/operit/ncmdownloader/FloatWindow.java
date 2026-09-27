@@ -40,6 +40,8 @@ public class FloatWindow {
     private LinearLayout body;
     private TextView tvSong;
     private TextView tvStatus;
+    private android.widget.ProgressBar pb;
+    private TextView tvProgress;
     private RadioGroup rgBr;
     private LinearLayout listWrap;
     private LinearLayout listContainer;
@@ -52,6 +54,11 @@ public class FloatWindow {
     private final List<NcmApi.Song> songs = new ArrayList<NcmApi.Song>();
 
     public static synchronized void show(Activity act) {
+        // 仅网易云音乐主进程显示悬浮窗
+        if (!isNetEaseProcess()) {
+            XposedBridge.log(TAG + " 当前进程非网易云音乐，跳过悬浮窗: " + currentProcessName());
+            return;
+        }
         if (inst != null) {
             inst.activity = act; // 更新activity引用（用于弹窗）
             return;
@@ -88,6 +95,32 @@ public class FloatWindow {
         if (inst != null) {
             inst.postStatus(s);
         }
+    }
+
+    /** 更新下载进度（供下载器回调；percent -1=未知长度） */
+    public static void updateProgress(int percent, String text) {
+        if (inst != null) {
+            inst.postProgress(percent, text);
+        }
+    }
+
+    /** 当前进程名（/proc/self/cmdline） */
+    private static String currentProcessName() {
+        try {
+            java.io.FileInputStream fis = new java.io.FileInputStream("/proc/self/cmdline");
+            StringBuilder sb = new StringBuilder();
+            int c;
+            while ((c = fis.read()) > 0) sb.append((char) c);
+            fis.close();
+            return sb.toString().trim();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** 是否运行在网易云音乐主进程 */
+    private static boolean isNetEaseProcess() {
+        return "com.netease.cloudmusic".equals(currentProcessName());
     }
 
     private FloatWindow(Activity act) {
@@ -240,6 +273,18 @@ public class FloatWindow {
         tvStatus.setTextSize(12);
         tvStatus.setPadding(0, dp(4), 0, dp(2));
         body.addView(tvStatus);
+
+        // 下载进度条（下载中显示）
+        pb = new android.widget.ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal);
+        pb.setMax(100);
+        pb.setVisibility(View.GONE);
+        body.addView(pb, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)));
+
+        tvProgress = new TextView(ctx);
+        tvProgress.setTextColor(Color.parseColor("#1DB954"));
+        tvProgress.setTextSize(11);
+        tvProgress.setVisibility(View.GONE);
+        body.addView(tvProgress);
 
         // 歌单列表（可滚动）
         listWrap = new LinearLayout(ctx);
@@ -418,6 +463,54 @@ public class FloatWindow {
         }
     }
 
+    /** 主线程更新进度条 */
+    private void postProgress(final int percent, final String text) {
+        try {
+            root.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (pb == null || tvProgress == null) return;
+                        if (percent == -2) { // 下载结束：隐藏进度区
+                            pb.setVisibility(View.GONE);
+                            tvProgress.setVisibility(View.GONE);
+                            return;
+                        }
+                        pb.setVisibility(View.VISIBLE);
+                        tvProgress.setVisibility(View.VISIBLE);
+                        if (percent < 0) {
+                            pb.setIndeterminate(true);
+                            tvProgress.setText("下载中... " + (text == null ? "" : text));
+                        } else {
+                            pb.setIndeterminate(false);
+                            pb.setProgress(percent);
+                            tvProgress.setText("下载 " + percent + "% " + (text == null ? "" : text));
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 隐藏进度区（下载结束/失败时调用） */
+    private void hideProgressArea() {
+        try {
+            root.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (pb != null) pb.setVisibility(View.GONE);
+                        if (tvProgress != null) tvProgress.setVisibility(View.GONE);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void promptPlaylist(final Activity act) {
         try {
             final EditText et = new EditText(act);
@@ -526,10 +619,18 @@ public class FloatWindow {
             public void run() {
                 try {
                     String fname = sanitize(s.artist) + " - " + sanitize(s.name) + ".mp3";
-                    NcmApi.downloadWithFallback(ctx, String.valueOf(s.id), br, readCookie(), fname);
+                    NcmApi.downloadWithFallback(ctx, String.valueOf(s.id), br, readCookie(), fname,
+                            new NcmApi.ProgressListener() {
+                                @Override
+                                public void onProgress(int percent) {
+                                    postProgress(percent, s.name);
+                                }
+                            });
                     postStatus("✅ 已下载: " + s.name);
                 } catch (Throwable t) {
                     postStatus("下载失败: " + t.getMessage());
+                } finally {
+                    hideProgressArea();
                 }
             }
         }).start();
@@ -541,26 +642,38 @@ public class FloatWindow {
             return;
         }
         final int brF = br;
+        final int total = songs.size();
         postStatus("批量下载中...");
         new Thread(new Runnable() {
             @Override
             public void run() {
                 int ok = 0, skip = 0, fail = 0;
                 String cookie = readCookie();
-                for (NcmApi.Song s : songs) {
+                for (int i = 0; i < total; i++) {
+                    final NcmApi.Song s = songs.get(i);
                     if (!s.isFree()) {
                         skip++;
                         continue;
                     }
+                    final int idx = i + 1;
                     try {
+                        postProgress(0, "(" + idx + "/" + total + ") " + s.name);
                         String fname = sanitize(s.artist) + " - " + sanitize(s.name) + ".mp3";
-                        NcmApi.downloadWithFallback(ctx, String.valueOf(s.id), brF, cookie, fname);
+                        NcmApi.downloadWithFallback(ctx, String.valueOf(s.id), brF, cookie, fname,
+                                new NcmApi.ProgressListener() {
+                                    @Override
+                                    public void onProgress(int percent) {
+                                        postProgress(percent, "(" + idx + "/" + total + ") " + s.name);
+                                    }
+                                });
                         ok++;
+                        postStatus("批量进行中: 已下 " + ok + " 首");
                     } catch (Throwable t) {
                         fail++;
                     }
                 }
                 postStatus("批量完成: 成功" + ok + " 跳过VIP" + skip + " 失败" + fail);
+                hideProgressArea();
             }
         }).start();
     }
