@@ -80,6 +80,26 @@ public class NcmModule implements IXposedHookLoadPackage {
                 }
             }
         });
+
+        // 前台感知：网易云 Activity 出前台时隐藏悬浮窗（避免挡住其他应用）
+        XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                try {
+                    FloatWindow.onActivityResume();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
+        XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
+            @Override
+            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+                try {
+                    FloatWindow.onActivityPause();
+                } catch (Throwable ignored) {
+                }
+            }
+        });
     }
 
     private synchronized void installHooks() {
@@ -159,42 +179,9 @@ public class NcmModule implements IXposedHookLoadPackage {
 
             // 更新悬浮窗
             FloatWindow.updateSong(pureId, title, artist);
-
-            // 自动下载（受设置开关控制）
-            if (title != null && artist != null && isAutoDownloadEnabled()) {
-                Downloader.getInstance().onSongDetected(appContext, pureId, title, artist);
-            }
         } catch (Throwable t) {
             XposedBridge.log(TAG + " handleMetadata err " + t);
         }
-    }
-
-    /** 读取设置：工作模式 + 自动下载开关 + 默认音质 */
-    private static boolean isAutoDownloadEnabled() {
-        try {
-            if (appContext == null) {
-                return true;
-            }
-            Cursor c = appContext.getContentResolver().query(CurrentProvider.SETTINGS_URI, null, null, null, null);
-            if (c != null) {
-                try {
-                    if (c.moveToFirst()) {
-                        String mode = c.getString(0);
-                        boolean auto = c.getInt(1) == 1;
-                        // 仅手动模式：禁用模块自动功能
-                        if ("manual".equals(mode)) {
-                            return false;
-                        }
-                        return auto;
-                    }
-                } finally {
-                    c.close();
-                }
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + " 读取设置失败: " + t);
-        }
-        return true;
     }
 
     /** 绕过悬浮窗权限检查：OP_SYSTEM_ALERT_WINDOW=24 一律放行 */
