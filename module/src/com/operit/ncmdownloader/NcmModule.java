@@ -81,21 +81,15 @@ public class NcmModule implements IXposedHookLoadPackage {
             }
         });
 
-        // 前台感知：网易云 Activity 出前台时隐藏悬浮窗（避免挡住其他应用）
+        // 前台感知：每次 Activity onResume 时把内嵌界面挂到当前 Activity
+        // （界面直接嵌在网易云 Activity 内，切到其他应用自然不可见）
         XposedHelpers.findAndHookMethod(Activity.class, "onResume", new XC_MethodHook() {
             @Override
             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                 try {
-                    FloatWindow.onActivityResume();
-                } catch (Throwable ignored) {
-                }
-            }
-        });
-        XposedHelpers.findAndHookMethod(Activity.class, "onPause", new XC_MethodHook() {
-            @Override
-            protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
-                try {
-                    FloatWindow.onActivityPause();
+                    if (param.thisObject instanceof Activity) {
+                        FloatWindow.onActivityResume((Activity) param.thisObject);
+                    }
                 } catch (Throwable ignored) {
                 }
             }
