@@ -314,7 +314,7 @@ public class MainActivity extends Activity {
         final RadioGroup modeGroup = new RadioGroup(this);
         modeGroup.setOrientation(RadioGroup.VERTICAL);
         RadioButton rbAuto = new RadioButton(this);
-        rbAuto.setText("自动模式（推荐）：root环境自动抓取当前歌曲+悬浮窗+可选自动下载；非root环境手动解析同样可用");
+        rbAuto.setText("自动模式（推荐）：root环境自动抓取当前歌曲+悬浮窗；非root环境手动解析同样可用");
         rbAuto.setId(3001);
         rbAuto.setTextSize(13);
         RadioButton rbManual = new RadioButton(this);
@@ -326,13 +326,6 @@ public class MainActivity extends Activity {
         modeGroup.check("manual".equals(loadMode()) ? 3002 : 3001);
         root.addView(modeGroup);
 
-        root.addView(title("自动下载（root环境切歌自动保存）", 15, true));
-        final CheckBox cbAutoDl = new CheckBox(this);
-        cbAutoDl.setText("切歌时自动下载到 Music/NCM自动下载/");
-        cbAutoDl.setTextSize(13);
-        cbAutoDl.setChecked(loadAutoDl());
-        root.addView(cbAutoDl);
-
         root.addView(title("默认音质", 15, true));
         final RadioGroup brGroup = new RadioGroup(this);
         brGroup.setOrientation(RadioGroup.HORIZONTAL);
@@ -343,7 +336,7 @@ public class MainActivity extends Activity {
 
         root.addView(title("说明", 13, true));
         TextView desc = new TextView(this);
-        desc.setText("· root环境：LSPosed启用模块→作用域勾选网易云→重启网易云生效\n· 自动获取当前歌曲需网易云处于播放状态\n· 自动下载开关与工作模式由模块进程实时读取（无需重启）");
+        desc.setText("· root环境：LSPosed启用模块→作用域勾选网易云→重启网易云生效\n· 自动获取当前歌曲需网易云处于播放状态\n· 悬浮窗仅在网易云前台显示，切到其他应用自动隐藏\n· 已取消切歌自动下载（避免与手动下载重复），下载请在悬浮窗中手动点击");
         desc.setTextSize(12);
         root.addView(desc);
 
@@ -353,13 +346,11 @@ public class MainActivity extends Activity {
             @Override
             public void onClick(View v) {
                 String mode = modeGroup.getCheckedRadioButtonId() == 3002 ? "manual" : "auto";
-                boolean auto = cbAutoDl.isChecked();
                 int br = brGroup.getCheckedRadioButtonId();
                 if (br == 0) br = currentBr;
-                saveSettings(mode, auto, br);
-                pushSettingsToProvider(mode, auto, br);
-                toast("已保存：模式=" + ("manual".equals(mode) ? "仅手动" : "自动")
-                        + " 自动下载=" + (auto ? "开" : "关"));
+                saveSettings(mode, false, br);
+                pushSettingsToProvider(mode, false, br);
+                toast("已保存：模式=" + ("manual".equals(mode) ? "仅手动" : "自动"));
                 finish();
             }
         });
