@@ -135,11 +135,20 @@ public class Downloader {
     }
 
     private void download(Context context, String id, String fname) throws Exception {
-        // 多通道获取链接并下载（含老外链兜底+重试）
+        // 多通道获取链接并下载（含老外链兜底+重试），进度实时上报悬浮窗
         String mu = NcmApi.readMusicUFromFile("/data/data/com.netease.cloudmusic/shared_prefs/cm_cookie_storage.xml");
         String cookie = (mu != null && mu.length() > 0) ? "MUSIC_U=" + mu : "";
-        NcmApi.downloadWithFallback(context, id, 320000, cookie, fname);
-        XposedBridge.log(TAG + " 下载完成: " + fname);
+        try {
+            NcmApi.downloadWithFallback(context, id, 320000, cookie, fname, new NcmApi.ProgressListener() {
+                @Override
+                public void onProgress(int percent) {
+                    FloatWindow.updateProgress(percent, "自动下载");
+                }
+            });
+            XposedBridge.log(TAG + " 下载完成: " + fname);
+        } finally {
+            FloatWindow.updateProgress(-2, "自动下载");
+        }
     }
 
     private String fetchUrl(String id) {
