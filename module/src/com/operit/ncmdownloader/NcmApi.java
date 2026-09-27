@@ -33,6 +33,11 @@ public class NcmApi {
     public static final int BR_HIGH = 320000;
     public static final int BR_LOSSLESS = 999000;
 
+    /** 下载进度回调：percent 0-100，-1 表示总长度未知 */
+    public interface ProgressListener {
+        void onProgress(int percent);
+    }
+
     public static class Song {
         public long id;
         public String name;
@@ -241,6 +246,11 @@ public class NcmApi {
 
     /** 下载（多轮新URL重试 + http/https变体 + 老外链接口兜底） */
     public static Uri downloadWithFallback(Context ctx, String id, int br, String cookie, String fname) throws Exception {
+        return downloadWithFallback(ctx, id, br, cookie, fname, null);
+    }
+
+    /** 下载（带进度回调版） */
+    public static Uri downloadWithFallback(Context ctx, String id, int br, String cookie, String fname, ProgressListener pl) throws Exception {
         Exception last = null;
         // 两轮：每轮用全新URL（CDN链接有时效，过期会403）
         for (int i = 0; i < 2; i++) {
@@ -253,7 +263,7 @@ public class NcmApi {
                 continue;
             }
             try {
-                return downloadToStorage(ctx, url, fname);
+                return downloadToStorage(ctx, url, fname, pl);
             } catch (Exception e) {
                 last = e;
             }
@@ -262,7 +272,7 @@ public class NcmApi {
         String outer = fetchOuterUrl(id);
         if (outer != null) {
             try {
-                return downloadToStorage(ctx, outer, fname);
+                return downloadToStorage(ctx, outer, fname, pl);
             } catch (Exception ignored) {
             }
         }
@@ -360,10 +370,14 @@ public class NcmApi {
 
     /** 下载音频流到 Music/NCM自动下载/，返回 Uri（可播放）；失败自动重试一次 + 系统DownloadManager兜底 */
     public static Uri downloadToStorage(Context context, String url, String fname) throws Exception {
+        return downloadToStorage(context, url, fname, null);
+    }
+
+    public static Uri downloadToStorage(Context context, String url, String fname, ProgressListener pl) throws Exception {
         Exception lastErr = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
-                return downloadOnce(context, url, fname);
+                return downloadOnce(context, url, fname, pl);
             } catch (Exception e) {
                 lastErr = e;
                 try {
@@ -374,7 +388,7 @@ public class NcmApi {
         }
         // HttpURLConnection 被CDN拒绝(403)时，改用系统DownloadManager（系统网络栈）
         try {
-            return downloadViaDownloadManager(context, url, fname);
+            return downloadViaDownloadManager(context, url, fname, pl);
         } catch (Throwable t) {
             // 忽略，抛原始错误
         }
@@ -382,7 +396,7 @@ public class NcmApi {
     }
 
     /** 系统DownloadManager下载（保存到 Music/NCM自动下载/，等待完成） */
-    private static Uri downloadViaDownloadManager(Context context, String url, String fname) throws Exception {
+    private static Uri downloadViaDownloadManager(Context context, String url, String fname, ProgressListener pl) throws Exception {
         DownloadManager dm = (DownloadManager) context.getSystemService(Context.DOWNLOAD_SERVICE);
         DownloadManager.Request req = new DownloadManager.Request(Uri.parse(url));
         req.setAllowedNetworkTypes(DownloadManager.Request.NETWORK_WIFI | DownloadManager.Request.NETWORK_MOBILE);
@@ -402,8 +416,18 @@ public class NcmApi {
                 c = dm.query(q);
                 if (c != null && c.moveToFirst()) {
                     int status = c.getInt(c.getColumnIndex(DownloadManager.COLUMN_STATUS));
+                    // 上报进度
+                    if (pl != null && status != DownloadManager.STATUS_SUCCESSFUL) {
+                        try {
+                            int bytes = c.getInt(c.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                            int total = c.getInt(c.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                            pl.onProgress(total > 0 ? (int) ((long) bytes * 100 / total) : -1);
+                        } catch (Throwable ignored) {
+                        }
+                    }
                     if (status == DownloadManager.STATUS_SUCCESSFUL) {
                         c.close();
+                        if (pl != null) pl.onProgress(100);
                         File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), "NCM自动下载/" + fname);
                         return Uri.fromFile(f);
                     } else if (status == DownloadManager.STATUS_FAILED) {
@@ -420,20 +444,20 @@ public class NcmApi {
         throw new Exception("下载超时");
     }
 
-    private static Uri downloadOnce(Context context, String url, String fname) throws Exception {
+    private static Uri downloadOnce(Context context, String url, String fname, ProgressListener pl) throws Exception {
         // 网易云CDN链接为http明文（App端即http下载）。优先原样http，失败再试https变体
         try {
-            return downloadRaw(context, url, fname);
+            return downloadRaw(context, url, fname, pl);
         } catch (Exception e) {
             if (url != null && url.startsWith("http://")) {
                 String httpsUrl = "https://" + url.substring(7);
-                return downloadRaw(context, httpsUrl, fname);
+                return downloadRaw(context, httpsUrl, fname, pl);
             }
             throw e;
         }
     }
 
-    private static Uri downloadRaw(Context context, String url, String fname) throws Exception {
+    private static Uri downloadRaw(Context context, String url, String fname, ProgressListener pl) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
         conn.setConnectTimeout(20000);
         conn.setReadTimeout(120000);
@@ -460,6 +484,9 @@ public class NcmApi {
         InputStream in = conn.getInputStream();
         byte[] buf = new byte[8192];
         int n;
+        long total = conn.getContentLength();
+        long written = 0;
+        int lastPct = -2;
         if (Build.VERSION.SDK_INT >= 29) {
             ContentValues cv = new ContentValues();
             cv.put(MediaStore.MediaColumns.DISPLAY_NAME, fname);
@@ -472,7 +499,18 @@ public class NcmApi {
                 throw new Exception("MediaStore 插入失败");
             }
             OutputStream os = context.getContentResolver().openOutputStream(uri);
-            while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+            while ((n = in.read(buf)) > 0) {
+                os.write(buf, 0, n);
+                written += n;
+                if (pl != null) {
+                    int pct = total > 0 ? (int) (written * 100 / total) : -1;
+                    if (pct != lastPct) {
+                        lastPct = pct;
+                        pl.onProgress(pct);
+                    }
+                }
+            }
+            if (pl != null) pl.onProgress(100);
             os.close();
             in.close();
             conn.disconnect();
@@ -486,7 +524,18 @@ public class NcmApi {
             }
             File f = new File(dir, fname);
             FileOutputStream fos = new FileOutputStream(f);
-            while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+            while ((n = in.read(buf)) > 0) {
+                fos.write(buf, 0, n);
+                written += n;
+                if (pl != null) {
+                    int pct = total > 0 ? (int) (written * 100 / total) : -1;
+                    if (pct != lastPct) {
+                        lastPct = pct;
+                        pl.onProgress(pct);
+                    }
+                }
+            }
+            if (pl != null) pl.onProgress(100);
             fos.close();
             in.close();
             conn.disconnect();
