@@ -5,15 +5,17 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
-import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
@@ -26,66 +28,74 @@ import java.util.List;
 import de.robv.android.xposed.XposedBridge;
 
 /**
- * 悬浮窗：注入网易云进程，显示当前歌曲并提供下载面板。
- * 支持拖动、最小化、音质选择、单曲下载、歌单批量下载（自动跳过VIP）。
+ * 内嵌式界面（v3.0 起）：不再使用系统悬浮窗（overlay），
+ * 直接把 UI addContentView 嵌入网易云自己的 Activity。
+ *
+ * 优点：
+ *  - 切到其他应用 / 按 Home → 随 Activity 一起不可见，永远不会挡住其他应用
+ *  - 无需悬浮窗权限（AppOps hook 仅作兼容保留）
+ *  - 网易云内部切换 Activity 时由 onResume 重新挂载，状态（最小化/位置/歌单）保留
  */
 public class FloatWindow {
 
     private static final String TAG = "NcmDownloader";
     private static FloatWindow inst;
-    /** 网易云前台 Activity 计数（0=不在前台，悬浮窗应隐藏） */
-    private static volatile int resumeCount = 0;
+    private static final Handler UI = new Handler(Looper.getMainLooper());
 
     private final Context ctx;
-    private final WindowManager wm;
-    private LinearLayout root;
+    private Activity host;
+    /** 根容器：内含面板 + 小圆球（最小化时切换可见性） */
+    private FrameLayout container;
+    /** 定位参数（TOP|END + margins），拖动时更新 */
+    private FrameLayout.LayoutParams lp;
+
+    private LinearLayout panel;
     private LinearLayout body;
     private TextView tvSong;
     private TextView tvStatus;
-    private android.widget.ProgressBar pb;
+    private ProgressBar pb;
     private TextView tvProgress;
     private RadioGroup rgBr;
     private LinearLayout listWrap;
     private LinearLayout listContainer;
-    private Activity activity;
     private View iconView;
-    private WindowManager.LayoutParams iconLp;
-    private WindowManager.LayoutParams rootLp;
-    private boolean rootAttached = false;
+
     private boolean minimized = false;
     private int br = NcmApi.BR_HIGH;
     private String currentId = "", currentTitle = "", currentArtist = "";
     private final List<NcmApi.Song> songs = new ArrayList<NcmApi.Song>();
 
-    public static synchronized void show(Activity act) {
-        // 仅网易云音乐主进程显示悬浮窗
-        if (!isNetEaseProcess()) {
-            XposedBridge.log(TAG + " 当前进程非网易云音乐，跳过悬浮窗: " + currentProcessName());
-            return;
-        }
-        if (inst != null) {
-            inst.activity = act; // 更新activity引用（用于弹窗）
-            return;
-        }
+    // ==================== 静态入口 ====================
+
+    public static synchronized void show(final Activity act) {
         try {
-            final Activity a = act;
-            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
-                inst = new FloatWindow(a);
-            } else {
-                // 非主线程调用时，切到主线程创建（WindowManager需要主线程Looper）
-                new android.os.Handler(android.os.Looper.getMainLooper()).post(new Runnable() {
-                    @Override
-                    public void run() {
-                        try {
-                            inst = new FloatWindow(a);
-                        } catch (Throwable t) {
-                            XposedBridge.log(TAG + " 悬浮窗创建失败: " + t);
-                        }
-                    }
-                });
+            if (inst != null) {
+                inst.attachTo(act);
+                return;
             }
+            UI.post(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        if (inst == null) {
+                            inst = new FloatWindow(act);
+                        } else {
+                            inst.attachTo(act);
+                        }
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + " 界面创建失败: " + t);
+                    }
+                }
+            });
         } catch (Throwable t) {
-            XposedBridge.log(TAG + " 悬浮窗创建失败: " + t);
+            XposedBridge.log(TAG + " show 失败: " + t);
+        }
+    }
+
+    /** 网易云任一 Activity onResume → 把界面重新挂到当前 Activity（跟随前台） */
+    public static void onActivityResume(final Activity act) {
+        if (inst != null) {
+            inst.attachTo(act);
         }
     }
 
@@ -101,152 +111,75 @@ public class FloatWindow {
         }
     }
 
-    /** 更新下载进度（供下载器回调；percent -1=未知长度） */
+    /** 更新下载进度（percent：0-100，-1=未知长度，-2=结束隐藏） */
     public static void updateProgress(int percent, String text) {
         if (inst != null) {
             inst.postProgress(percent, text);
         }
     }
 
-    /** 网易云任一 Activity 进入前台 → 悬浮窗可见 */
-    public static void onActivityResume() {
-        resumeCount++;
-        if (inst != null) {
-            inst.setForeground(true);
-        }
-    }
-
-    /** 网易云 Activity 进入后台 → 延迟检查，全部暂停则隐藏悬浮窗 */
-    public static void onActivityPause() {
-        resumeCount--;
-        if (inst != null) {
-            inst.scheduleForegroundCheck();
-        }
-    }
-
-    /** 延迟检查：400ms 后仍无前台 Activity 才隐藏（避免内部切换页面时闪烁） */
-    private void scheduleForegroundCheck() {
-        try {
-            root.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    if (resumeCount <= 0) {
-                        resumeCount = 0;
-                        setForeground(false);
-                    }
-                }
-            }, 400);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** 前台可见性切换：离开网易云 removeView，回来重新 addView（不会挡在其他应用上方） */
-    private void setForeground(final boolean visible) {
-        try {
-            root.post(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        if (visible) {
-                            if (minimized) {
-                                if (iconView == null) showIcon();
-                            } else {
-                                if (!rootAttached) {
-                                    wm.addView(root, rootLp != null ? rootLp
-                                            : (WindowManager.LayoutParams) root.getLayoutParams());
-                                    rootAttached = true;
-                                }
-                            }
-                        } else {
-                            if (minimized) {
-                                hideIcon();
-                            } else {
-                                if (rootAttached) {
-                                    wm.removeView(root);
-                                    rootAttached = false;
-                                }
-                            }
-                        }
-                    } catch (Throwable t) {
-                        XposedBridge.log(TAG + " 悬浮窗可见性切换失败: " + t);
-                    }
-                }
-            });
-        } catch (Throwable ignored) {
-        }
-    }
-
-    /** 当前进程名（/proc/self/cmdline） */
-    private static String currentProcessName() {
-        try {
-            java.io.FileInputStream fis = new java.io.FileInputStream("/proc/self/cmdline");
-            StringBuilder sb = new StringBuilder();
-            int c;
-            while ((c = fis.read()) > 0) sb.append((char) c);
-            fis.close();
-            return sb.toString().trim();
-        } catch (Throwable t) {
-            return "";
-        }
-    }
-
-    /** 是否运行在网易云音乐主进程 */
-    private static boolean isNetEaseProcess() {
-        return "com.netease.cloudmusic".equals(currentProcessName());
-    }
-
     private FloatWindow(Activity act) {
         this.ctx = act.getApplicationContext();
-        this.activity = act;
-        this.wm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
-        buildView(act);
-        addToWindow(act);
+        buildUi(act);
+        attachTo(act);
+        XposedBridge.log(TAG + " 内嵌界面已创建");
     }
 
-    private void buildView(final Activity act) {
-        root = new LinearLayout(ctx);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundDrawable(rounded(Color.parseColor("#F5FFFFFF"), dp(14)));
-        LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(dp(320), ViewGroup.LayoutParams.WRAP_CONTENT);
-        root.setLayoutParams(rp);
-        // 防止父级LinearLayout干扰
-        root.setPadding(dp(10), dp(8), dp(10), dp(8));
+    /** 把根容器挂到指定 Activity 的内容区（addContentView）；已挂同一 Activity 则跳过 */
+    private void attachTo(final Activity act) {
+        if (act == null || act.isFinishing()) {
+            return;
+        }
+        try {
+            if (act == host && container.getParent() != null) {
+                return;
+            }
+            // 从旧父容器摘除（网易云 Activity 切换时）
+            ViewGroup oldParent = (ViewGroup) container.getParent();
+            if (oldParent != null) {
+                oldParent.removeView(container);
+            }
+            host = act;
+            if (lp == null) {
+                lp = new FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.gravity = Gravity.TOP | Gravity.END;
+                lp.topMargin = dp(96);
+                lp.rightMargin = dp(10);
+            }
+            act.getWindow().addContentView(container, lp);
+            refreshMinimizeState();
+            XposedBridge.log(TAG + " 内嵌界面已挂载: " + act.getClass().getSimpleName());
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + " 挂载失败: " + t);
+        }
+    }
+
+    // ==================== UI 构建 ====================
+
+    private void buildUi(final Activity act) {
+        container = new FrameLayout(ctx);
+
+        // ---------- 面板 ----------
+        panel = new LinearLayout(ctx);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setBackgroundDrawable(rounded(Color.parseColor("#F5FFFFFF"), dp(14)));
+        panel.setPadding(dp(10), dp(8), dp(10), dp(8));
+        container.addView(panel, new FrameLayout.LayoutParams(dp(320), ViewGroup.LayoutParams.WRAP_CONTENT));
 
         // 标题栏（可拖动）
+        LinearLayout headerRow = new LinearLayout(ctx);
+        headerRow.setOrientation(LinearLayout.HORIZONTAL);
+        headerRow.setGravity(Gravity.CENTER_VERTICAL);
         final TextView header = new TextView(ctx);
-        header.setText("🎵 网易云下载  ⟶ 按住拖动");
+        header.setText("🎵 网易云下载  ⟶ 拖动");
         header.setTextColor(Color.parseColor("#1DB954"));
         header.setTextSize(14);
         header.setPadding(dp(4), dp(4), dp(4), dp(4));
         header.setGravity(Gravity.CENTER_VERTICAL);
         header.setSingleLine(true);
-        header.setOnTouchListener(new View.OnTouchListener() {
-            float startX, startY;
-            int startRawX, startRawY;
-
-            @Override
-            public boolean onTouch(View v, MotionEvent e) {
-                WindowManager.LayoutParams lp = (WindowManager.LayoutParams) root.getLayoutParams();
-                switch (e.getAction()) {
-                    case MotionEvent.ACTION_DOWN:
-                        startRawX = (int) e.getRawX();
-                        startRawY = (int) e.getRawY();
-                        startX = lp.x;
-                        startY = lp.y;
-                        return true;
-                    case MotionEvent.ACTION_MOVE:
-                        lp.x = (int) (startX + (e.getRawX() - startRawX));
-                        lp.y = (int) (startY + (e.getRawY() - startRawY));
-                        try {
-                            wm.updateViewLayout(root, lp);
-                        } catch (Throwable ignored) {
-                        }
-                        return true;
-                }
-                return false;
-            }
-        });
-        root.addView(header, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        DragHelper.install(header, this);
+        headerRow.addView(header, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
         Button btnMin = new Button(ctx);
         btnMin.setText("—");
@@ -258,7 +191,7 @@ public class FloatWindow {
                 toggleMinimize();
             }
         });
-        root.addView(btnMin);
+        headerRow.addView(btnMin);
 
         Button btnClose = new Button(ctx);
         btnClose.setText("✕");
@@ -270,12 +203,14 @@ public class FloatWindow {
                 close();
             }
         });
-        root.addView(btnClose);
+        headerRow.addView(btnClose);
+        panel.addView(headerRow);
 
-        // 主体（可收起）
+        // 主体
         body = new LinearLayout(ctx);
         body.setOrientation(LinearLayout.VERTICAL);
-        root.addView(body, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        panel.addView(body, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         tvSong = new TextView(ctx);
         tvSong.setText("当前歌曲: 无");
@@ -346,8 +281,8 @@ public class FloatWindow {
         tvStatus.setPadding(0, dp(4), 0, dp(2));
         body.addView(tvStatus);
 
-        // 下载进度条（下载中显示）
-        pb = new android.widget.ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal);
+        // 下载进度条
+        pb = new ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal);
         pb.setMax(100);
         pb.setVisibility(View.GONE);
         body.addView(pb, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8)));
@@ -358,17 +293,47 @@ public class FloatWindow {
         tvProgress.setVisibility(View.GONE);
         body.addView(tvProgress);
 
-        // 歌单列表（可滚动）
+        // 歌单列表
         listWrap = new LinearLayout(ctx);
         listWrap.setOrientation(LinearLayout.VERTICAL);
         ScrollView sv = new ScrollView(ctx);
         listContainer = new LinearLayout(ctx);
         listContainer.setOrientation(LinearLayout.VERTICAL);
-        sv.addView(listContainer, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        LinearLayout.LayoutParams svp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220));
-        listWrap.addView(sv, svp);
+        sv.addView(listContainer, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        listWrap.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220)));
         listWrap.setVisibility(View.GONE);
         body.addView(listWrap);
+
+        // ---------- 小圆球（最小化） ----------
+        TextView iv = new TextView(ctx);
+        iv.setText("♪");
+        iv.setTextColor(Color.WHITE);
+        iv.setTextSize(22);
+        iv.setGravity(Gravity.CENTER);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.OVAL);
+        bg.setColor(Color.parseColor("#E61DB954"));
+        iv.setBackgroundDrawable(bg);
+        FrameLayout.LayoutParams ivLp = new FrameLayout.LayoutParams(dp(48), dp(48));
+        container.addView(iv, ivLp);
+        iv.setVisibility(View.GONE);
+        iconView = iv;
+        DragHelper.install(iv, this);
+
+        refreshMinimizeState();
+    }
+
+    /** 面板 / 圆球 可见性切换 */
+    private void refreshMinimizeState() {
+        if (panel == null || iconView == null) return;
+        panel.setVisibility(minimized ? View.GONE : View.VISIBLE);
+        iconView.setVisibility(minimized ? View.VISIBLE : View.GONE);
+    }
+
+    private void toggleMinimize() {
+        minimized = !minimized;
+        refreshMinimizeState();
     }
 
     private void addBrOption(String label, final int value, boolean checked) {
@@ -381,222 +346,108 @@ public class FloatWindow {
         rgBr.addView(rb);
     }
 
-    private void addToWindow(Activity act) {
-        int type;
-        if (Build.VERSION.SDK_INT >= 26) {
-            type = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
-        } else {
-            type = WindowManager.LayoutParams.TYPE_PHONE;
-        }
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                dp(330), ViewGroup.LayoutParams.WRAP_CONTENT,
-                type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                android.graphics.PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.TOP | Gravity.END;
-        lp.x = dp(8);
-        lp.y = dp(160);
-        rootLp = lp;
-        try {
-            wm.addView(root, lp);
-            rootAttached = true;
-            XposedBridge.log(TAG + " 悬浮窗已添加");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + " 悬浮窗添加失败(需悬浮窗权限): " + t);
-        }
-    }
+    // ==================== 拖动（更新 container 的 margins） ====================
 
-    private void toggleMinimize() {
-        minimized = !minimized;
-        if (minimized) {
-            try {
-                wm.removeView(root);
-                rootAttached = false;
-            } catch (Throwable ignored) {
-            }
-            showIcon();
-        } else {
-            hideIcon();
-            try {
-                wm.addView(root, rootLp != null ? rootLp : (WindowManager.LayoutParams) root.getLayoutParams());
-                rootAttached = true;
-            } catch (Throwable t) {
-                XposedBridge.log(TAG + " 恢复悬浮窗失败: " + t);
-            }
-        }
-    }
+    static class DragHelper {
+        static void install(final View handle, final FloatWindow fw) {
+            handle.setOnTouchListener(new View.OnTouchListener() {
+                float downRawX, downRawY;
+                int startRight, startTop;
 
-    private int getType() {
-        if (Build.VERSION.SDK_INT >= 26) {
-            return WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
-        }
-        return WindowManager.LayoutParams.TYPE_PHONE;
-    }
-
-    /** 显示可拖动小图标（悬浮球），点击恢复面板 */
-    private void showIcon() {
-        if (iconView != null) return;
-        TextView iv = new TextView(ctx);
-        iv.setText("♪");
-        iv.setTextColor(Color.WHITE);
-        iv.setTextSize(22);
-        iv.setGravity(Gravity.CENTER);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(Color.parseColor("#E61DB954"));
-        iv.setBackgroundDrawable(bg);
-        final int size = dp(48);
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                size, size, getType(),
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                android.graphics.PixelFormat.TRANSLUCENT);
-        lp.gravity = Gravity.TOP | Gravity.END;
-        if (iconLp != null) { // 恢复上次位置
-            lp.x = iconLp.x;
-            lp.y = iconLp.y;
-        } else {
-            lp.x = dp(12);
-            lp.y = dp(200);
-        }
-        final float[] down = new float[4]; // rawX rawY lpX lpY
-        iv.setOnTouchListener(new View.OnTouchListener() {
-            @Override
-            public boolean onTouch(View v, MotionEvent e) {
-                WindowManager.LayoutParams p = (WindowManager.LayoutParams) v.getLayoutParams();
-                switch (e.getAction()) {
-                    case MotionEvent.ACTION_DOWN:
-                        down[0] = e.getRawX();
-                        down[1] = e.getRawY();
-                        down[2] = p.x;
-                        down[3] = p.y;
-                        return true;
-                    case MotionEvent.ACTION_MOVE:
-                        p.x = (int) (down[2] + (e.getRawX() - down[0]));
-                        p.y = (int) (down[3] + (e.getRawY() - down[1]));
-                        try {
-                            wm.updateViewLayout(v, p);
-                        } catch (Throwable ignored) {
-                        }
-                        return true;
-                    case MotionEvent.ACTION_UP:
-                        float dx = e.getRawX() - down[0];
-                        float dy = e.getRawY() - down[1];
-                        if (dx * dx + dy * dy < 400) { // 位移<20px视为点击
-                            toggleMinimize();
-                        }
-                        return true;
-                }
-                return false;
-            }
-        });
-        try {
-            wm.addView(iv, lp);
-            iconView = iv;
-            iconLp = lp;
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + " 图标添加失败: " + t);
-        }
-    }
-
-    private void hideIcon() {
-        if (iconView != null) {
-            try {
-                wm.removeView(iconView);
-            } catch (Throwable ignored) {
-            }
-            iconView = null;
-        }
-    }
-
-    private void close() {
-        try {
-            wm.removeView(root);
-        } catch (Throwable ignored) {
-        }
-        hideIcon();
-        inst = null;
-    }
-
-    private void postSong(final String id, final String title, final String artist) {
-        try {
-            root.post(new Runnable() {
                 @Override
-                public void run() {
-                    currentId = id == null ? "" : id;
-                    currentTitle = title == null ? "" : title;
-                    currentArtist = artist == null ? "" : artist;
-                    tvSong.setText("当前歌曲: " + currentArtist + " - " + currentTitle + "\nID: " + currentId);
+                public boolean onTouch(View v, MotionEvent e) {
+                    switch (e.getAction()) {
+                        case MotionEvent.ACTION_DOWN:
+                            downRawX = e.getRawX();
+                            downRawY = e.getRawY();
+                            startRight = fw.lp.rightMargin;
+                            startTop = fw.lp.topMargin;
+                            return true;
+                        case MotionEvent.ACTION_MOVE:
+                            int dx = (int) (e.getRawX() - downRawX);
+                            int dy = (int) (e.getRawY() - downRawY);
+                            fw.lp.rightMargin = Math.max(0, startRight - dx);
+                            fw.lp.topMargin = Math.max(0, startTop + dy);
+                            fw.container.setLayoutParams(fw.lp);
+                            return true;
+                        case MotionEvent.ACTION_UP:
+                            float ddx = e.getRawX() - downRawX;
+                            float ddy = e.getRawY() - downRawY;
+                            if (v == fw.iconView && ddx * ddx + ddy * ddy < 400) {
+                                fw.toggleMinimize(); // 圆球点击=展开
+                            }
+                            return true;
+                    }
+                    return false;
                 }
             });
-        } catch (Throwable ignored) {
         }
+    }
+
+    // ==================== 歌曲/状态/进度 ====================
+
+    private void postSong(final String id, final String title, final String artist) {
+        UI.post(new Runnable() {
+            @Override
+            public void run() {
+                currentId = id == null ? "" : id;
+                currentTitle = title == null ? "" : title;
+                currentArtist = artist == null ? "" : artist;
+                if (tvSong != null) {
+                    tvSong.setText("当前歌曲: " + currentArtist + " - " + currentTitle + "\nID: " + currentId);
+                }
+            }
+        });
     }
 
     private void postStatus(final String s) {
-        try {
-            root.post(new Runnable() {
-                @Override
-                public void run() {
-                    tvStatus.setText(s);
-                }
-            });
-        } catch (Throwable ignored) {
-        }
+        UI.post(new Runnable() {
+            @Override
+            public void run() {
+                if (tvStatus != null) tvStatus.setText(s);
+            }
+        });
     }
 
-    /** 主线程更新进度条 */
     private void postProgress(final int percent, final String text) {
-        try {
-            root.post(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        if (pb == null || tvProgress == null) return;
-                        if (percent == -2) { // 下载结束：隐藏进度区
-                            pb.setVisibility(View.GONE);
-                            tvProgress.setVisibility(View.GONE);
-                            return;
-                        }
-                        pb.setVisibility(View.VISIBLE);
-                        tvProgress.setVisibility(View.VISIBLE);
-                        if (percent < 0) {
-                            pb.setIndeterminate(true);
-                            tvProgress.setText("下载中... " + (text == null ? "" : text));
-                        } else {
-                            pb.setIndeterminate(false);
-                            pb.setProgress(percent);
-                            tvProgress.setText("下载 " + percent + "% " + (text == null ? "" : text));
-                        }
-                    } catch (Throwable ignored) {
+        UI.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (pb == null || tvProgress == null) return;
+                    if (percent == -2) {
+                        pb.setVisibility(View.GONE);
+                        tvProgress.setVisibility(View.GONE);
+                        return;
                     }
+                    pb.setVisibility(View.VISIBLE);
+                    tvProgress.setVisibility(View.VISIBLE);
+                    if (percent < 0) {
+                        pb.setIndeterminate(true);
+                        tvProgress.setText("下载中... " + (text == null ? "" : text));
+                    } else {
+                        pb.setIndeterminate(false);
+                        pb.setProgress(percent);
+                        tvProgress.setText("下载 " + percent + "% " + (text == null ? "" : text));
+                    }
+                } catch (Throwable ignored) {
                 }
-            });
-        } catch (Throwable ignored) {
-        }
+            }
+        });
     }
 
-    /** 隐藏进度区（下载结束/失败时调用） */
     private void hideProgressArea() {
-        try {
-            root.post(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        if (pb != null) pb.setVisibility(View.GONE);
-                        if (tvProgress != null) tvProgress.setVisibility(View.GONE);
-                    } catch (Throwable ignored) {
-                    }
-                }
-            });
-        } catch (Throwable ignored) {
-        }
+        postProgress(-2, null);
     }
+
+    // ==================== 歌单 / 下载 ====================
 
     private void promptPlaylist(final Activity act) {
         try {
-            final EditText et = new EditText(act);
+            Activity a = host != null && !host.isFinishing() ? host : act;
+            final EditText et = new EditText(a);
             et.setHint("歌单ID或分享链接");
-            AlertDialog dlg = new AlertDialog.Builder(act)
+            AlertDialog dlg = new AlertDialog.Builder(a)
                     .setTitle("输入歌单")
                     .setView(et)
                     .setPositiveButton("获取歌单", null)
@@ -608,7 +459,7 @@ public class FloatWindow {
                 public void onClick(View v) {
                     String input = et.getText().toString().trim();
                     if (input.length() == 0) {
-                        Toast.makeText(act, "请输入歌单ID", Toast.LENGTH_SHORT).show();
+                        Toast.makeText(a, "请输入歌单ID", Toast.LENGTH_SHORT).show();
                         return;
                     }
                     dlg.dismiss();
@@ -635,7 +486,7 @@ public class FloatWindow {
                     final List<NcmApi.Song> list = NcmApi.fetchPlaylist(id, null);
                     songs.clear();
                     songs.addAll(list);
-                    root.post(new Runnable() {
+                    UI.post(new Runnable() {
                         @Override
                         public void run() {
                             renderPlaylist();
@@ -784,5 +635,17 @@ public class FloatWindow {
         gd.setColor(color);
         gd.setCornerRadius(radius);
         return gd;
+    }
+
+    /** 关闭：从 Activity 中移除界面 */
+    private void close() {
+        try {
+            ViewGroup p = (ViewGroup) container.getParent();
+            if (p != null) {
+                p.removeView(container);
+            }
+        } catch (Throwable ignored) {
+        }
+        inst = null;
     }
 }
